@@ -139,3 +139,4 @@ target/
 .bpython_history
 .flake8
 /.air
+/.idea

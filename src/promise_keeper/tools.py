@@ -68,6 +68,27 @@ def model_tools() -> list[ChatCompletionFunctionToolParam]:
     return tools
 
 
+def format_relative_deadline(seconds: int) -> str:
+    if seconds % 86400 == 0:
+        days = seconds // 86400
+        unit = "day" if days == 1 else "days"
+        return f"Within {days} {unit}"
+    if seconds % 3600 == 0:
+        hours = seconds // 3600
+        unit = "hour" if hours == 1 else "hours"
+        return f"Within {hours} {unit}"
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        if minutes > 60:
+            hours = minutes // 60
+            remaining_minutes = minutes % 60
+            return f"Within {hours}h {remaining_minutes}m"
+        unit = "minute" if minutes == 1 else "minutes"
+        return f"Within {minutes} {unit}"
+    unit = "second" if seconds == 1 else "seconds"
+    return f"Within {seconds} {unit}"
+
+
 def create_promise(database: sqlite3.Connection, event: NormalizedEvent, decision: AgentDecision) -> PromiseRecord:
     now = event.received_at.astimezone(timezone.utc)
     depends_on_action: str | None = None
@@ -136,6 +157,8 @@ def execute_tool(database: sqlite3.Connection, action: UserAction, require_card:
                         changes["deadline_at"] = prerequisite.last_event_at + timedelta(
                             seconds=promise.relative_deadline_seconds,
                         )
+                        if not promise.deadline_text:
+                            changes["deadline_text"] = format_relative_deadline(promise.relative_deadline_seconds)
         else:
             changes["status"] = "confirmed"
             notification = "Promise confirmed."
@@ -176,13 +199,8 @@ def execute_tool(database: sqlite3.Connection, action: UserAction, require_card:
                         seconds=dependent.relative_deadline_seconds,
                     )
                     dep_changes["deadline_at"] = dep_deadline
-                    secs = dependent.relative_deadline_seconds
-                    if secs % 86400 == 0:
-                        dep_changes["deadline_text"] = f"Within {secs // 86400} days"
-                    elif secs >= 3600:
-                        dep_changes["deadline_text"] = f"Within {secs // 3600} hours"
-                    else:
-                        dep_changes["deadline_text"] = f"Within {secs // 60} minutes"
+                    if not dependent.deadline_text:
+                        dep_changes["deadline_text"] = format_relative_deadline(dependent.relative_deadline_seconds)
                 updated_dep = PromiseRecord.model_validate({**dependent.model_dump(), **dep_changes})
                 save_promise(database, updated_dep)
                 record_history(

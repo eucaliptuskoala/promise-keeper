@@ -16,10 +16,9 @@ from promise_keeper.storage import (
     has_dependency_cycle,
     initialize_storage,
     list_dependent_promises,
-    list_thread_open_promises,
     bind_card,
 )
-from promise_keeper.tools import create_promise, execute_tool
+from promise_keeper.tools import create_promise, execute_tool, format_relative_deadline
 
 
 @pytest.fixture
@@ -464,3 +463,90 @@ def test_build_promise_card_waiting_state():
     assert "promise_complete" not in action_ids
     assert "promise_reschedule" in action_ids
     assert "promise_dismiss" in action_ids
+
+
+def test_format_relative_deadline():
+    assert format_relative_deadline(86400) == "Within 1 day"
+    assert format_relative_deadline(172800) == "Within 2 days"
+    assert format_relative_deadline(3600) == "Within 1 hour"
+    assert format_relative_deadline(7200) == "Within 2 hours"
+    assert format_relative_deadline(5400) == "Within 1h 30m"
+    assert format_relative_deadline(60) == "Within 1 minute"
+    assert format_relative_deadline(120) == "Within 2 minutes"
+    assert format_relative_deadline(45) == "Within 45 seconds"
+    assert format_relative_deadline(1) == "Within 1 second"
+
+
+@pytest.mark.parametrize("explicit_text", ["within 2 days after API", None])
+def test_relative_deadline_text_parity_unblock_and_late_confirm(database, explicit_text):
+    t0 = datetime(2026, 9, 12, 10, 0, tzinfo=timezone.utc)
+    t1 = t0 + timedelta(minutes=1)
+    t2 = t0 + timedelta(minutes=2)
+    t3 = t0 + timedelta(minutes=3)
+    t4 = t0 + timedelta(hours=1)
+    t5 = t0 + timedelta(hours=2)
+    t6 = t0 + timedelta(hours=3)
+
+    expected = explicit_text or "Within 2 days"
+
+    # 1. Unblock path: confirmed while prerequisite open -> unblocked on complete
+    ev1 = NormalizedEvent(
+        event_id="e1", workspace_id="T1", channel_id="C1", author_id="alice",
+        text="API", event_ts=f"{int(t0.timestamp())}.000001", received_at=t0,
+    )
+    p1 = create_promise(database, ev1, AgentDecision(operation="create", action="API", evidence="API"))
+    execute_tool(database, UserAction(
+        action_name="confirm", promise_id=p1.promise_id, actor_id="alice", workspace_id="T1",
+        event_id="c1", channel_id="C1", message_ts=ev1.event_ts, occurred_at=t1, received_at=t1,
+    ))
+    ev_dep1 = ev1.model_copy(update={
+        "event_id": "dep1-e", "author_id": "bob", "event_ts": f"{int(t2.timestamp())}.000001",
+    })
+    dep1 = create_promise(database, ev_dep1, AgentDecision(
+        operation="create", action="UI", evidence="API", depends_on_promise_id=p1.promise_id,
+        relative_deadline_seconds=172800, deadline_text=explicit_text,
+    ))
+    r_conf = execute_tool(database, UserAction(
+        action_name="confirm", promise_id=dep1.promise_id, actor_id="bob", workspace_id="T1",
+        event_id="c-dep1", channel_id="C1", message_ts=ev_dep1.event_ts, occurred_at=t3, received_at=t3,
+    ))
+    assert r_conf.updated_card.status == "waiting"
+
+    r_comp = execute_tool(database, UserAction(
+        action_name="complete", promise_id=p1.promise_id, actor_id="alice", workspace_id="T1",
+        event_id="done1", channel_id="C1", message_ts=ev1.event_ts, occurred_at=t4, received_at=t4,
+    ))
+    assert len(r_comp.unblocked_cards) == 1
+    unblocked = r_comp.unblocked_cards[0]
+    assert unblocked.deadline_text == expected
+
+    # 2. Late confirm path: confirmed after prerequisite already completed
+    ev2 = NormalizedEvent(
+        event_id="e2", workspace_id="T1", channel_id="C1", author_id="alice",
+        text="API", event_ts=f"{int(t0.timestamp())}.000001", received_at=t0,
+    )
+    p2 = create_promise(database, ev2, AgentDecision(operation="create", action="API", evidence="API"))
+    execute_tool(database, UserAction(
+        action_name="confirm", promise_id=p2.promise_id, actor_id="alice", workspace_id="T1",
+        event_id="c2", channel_id="C1", message_ts=ev2.event_ts, occurred_at=t1, received_at=t1,
+    ))
+    execute_tool(database, UserAction(
+        action_name="complete", promise_id=p2.promise_id, actor_id="alice", workspace_id="T1",
+        event_id="done2", channel_id="C1", message_ts=ev2.event_ts, occurred_at=t4, received_at=t4,
+    ))
+    ev_dep2 = ev2.model_copy(update={
+        "event_id": "dep2-e", "author_id": "bob", "event_ts": f"{int(t5.timestamp())}.000001",
+    })
+    dep2 = create_promise(database, ev_dep2, AgentDecision(
+        operation="create", action="UI", evidence="API", depends_on_promise_id=p2.promise_id,
+        relative_deadline_seconds=172800, deadline_text=explicit_text,
+    ))
+    r_late = execute_tool(database, UserAction(
+        action_name="confirm", promise_id=dep2.promise_id, actor_id="bob", workspace_id="T1",
+        event_id="c-dep2", channel_id="C1", message_ts=ev_dep2.event_ts, occurred_at=t6, received_at=t6,
+    ))
+    assert r_late.updated_card.status == "confirmed"
+    assert r_late.updated_card.deadline_text == expected
+
+    # Parity check
+    assert unblocked.deadline_text == r_late.updated_card.deadline_text
