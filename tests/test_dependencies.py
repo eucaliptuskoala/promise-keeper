@@ -316,6 +316,114 @@ def test_confirm_when_prerequisite_already_completed(database):
     assert res.updated_card.status == "confirmed"
 
 
+@pytest.mark.parametrize("created_after_completion", [False, True])
+def test_late_confirmation_uses_completed_prerequisite_deadline(database, created_after_completion):
+    now = datetime(2026, 9, 12, 10, tzinfo=timezone.utc)
+    event = NormalizedEvent(
+        event_id="api", workspace_id="T1", channel_id="C1", author_id="alice",
+        text="Build API", event_ts=f"{int(now.timestamp())}.000000", received_at=now,
+    )
+    prerequisite = create_promise(database, event, AgentDecision(operation="create", action="Build API", evidence="Build API"))
+    assert execute_tool(database, UserAction(
+        action_name="confirm", promise_id=prerequisite.promise_id, actor_id="alice", workspace_id="T1",
+        event_id="confirm-api", channel_id="C1", message_ts=event.event_ts, occurred_at=now, received_at=now,
+    )).success
+    completed_at = now + timedelta(hours=1)
+    created_at = now + timedelta(hours=2) if created_after_completion else now + timedelta(minutes=2)
+    dependent_event = event.model_copy(update={
+        "event_id": "ui", "author_id": "bob", "text": "Build UI within 2 days after API",
+        "event_ts": f"{int(created_at.timestamp())}.000000", "thread_ts": event.event_ts,
+        "received_at": now + timedelta(hours=3),
+    })
+    interpret = MagicMock(return_value=AgentDecision(
+        operation="create", action="Build UI", evidence="Build UI", deadline_text="within 2 days",
+        depends_on_promise_id=prerequisite.promise_id, relative_deadline_seconds=172800,
+    ))
+    if not created_after_completion:
+        database.commit()
+        dependent = process_event(dependent_event, database, interpret).promise_card
+    assert execute_tool(database, UserAction(
+        action_name="complete", promise_id=prerequisite.promise_id, actor_id="alice", workspace_id="T1",
+        event_id="complete-api", channel_id="C1", message_ts=event.event_ts,
+        occurred_at=completed_at, received_at=now + timedelta(hours=3),
+    )).success
+    if created_after_completion:
+        database.commit()
+        dependent = process_event(dependent_event, database, interpret).promise_card
+    assert dependent is not None
+    result = execute_tool(database, UserAction(
+        action_name="confirm", promise_id=dependent.promise_id, actor_id="bob", workspace_id="T1",
+        event_id="confirm-ui", channel_id="C1", message_ts=dependent_event.event_ts,
+        occurred_at=now + timedelta(hours=4), received_at=now + timedelta(hours=5),
+    ))
+    assert result.success
+    assert result.updated_card.deadline_at == completed_at + timedelta(days=2)
+    send = MagicMock(return_value=True)
+    check_reminders(database, send, completed_at + timedelta(days=2, seconds=1), "T1", frozenset({"C1"}))
+    send.assert_called_once()
+
+
+@pytest.mark.parametrize("rescheduled", [False, True])
+def test_unblocking_preserves_causal_order(database, rescheduled):
+    now = datetime(2026, 9, 12, 10, tzinfo=timezone.utc)
+    event = NormalizedEvent(
+        event_id="api", workspace_id="T1", channel_id="C1", author_id="alice",
+        text="Build API", event_ts=f"{int(now.timestamp())}.000000", received_at=now,
+    )
+    prerequisite = create_promise(database, event, AgentDecision(operation="create", action="Build API", evidence="Build API"))
+    dependent = create_promise(database, event.model_copy(update={"event_id": "ui", "author_id": "bob"}), AgentDecision(
+        operation="create", action="Build UI", evidence="Build API", depends_on_promise_id=prerequisite.promise_id,
+    ))
+    for promise in (prerequisite, dependent):
+        assert execute_tool(database, UserAction(
+            action_name="confirm", promise_id=promise.promise_id, actor_id=promise.owner_id, workspace_id="T1",
+            event_id=f"confirm-{promise.owner_id}", channel_id="C1", message_ts=event.event_ts,
+            occurred_at=now, received_at=now,
+        )).success
+    if rescheduled:
+        assert execute_tool(database, UserAction(
+            action_name="reschedule", promise_id=dependent.promise_id, actor_id="bob", workspace_id="T1",
+            event_id="reschedule-ui", channel_id="C1", message_ts=event.event_ts,
+            occurred_at=now + timedelta(hours=2), received_at=now + timedelta(hours=2),
+            deadline_at=now + timedelta(days=1),
+        )).success
+    assert execute_tool(database, UserAction(
+        action_name="complete", promise_id=prerequisite.promise_id, actor_id="alice", workspace_id="T1",
+        event_id="complete-api", channel_id="C1", message_ts=event.event_ts,
+        occurred_at=now + timedelta(hours=1), received_at=now + timedelta(hours=3),
+    )).success
+    current = get_promise(database, dependent.promise_id)
+    assert current.last_event_at == now + timedelta(hours=2 if rescheduled else 1)
+    result = execute_tool(database, UserAction(
+        action_name="complete", promise_id=dependent.promise_id, actor_id="bob", workspace_id="T1",
+        event_id="delayed-ui", channel_id="C1", message_ts=event.event_ts,
+        occurred_at=now + timedelta(minutes=30), received_at=now + timedelta(hours=4),
+    ))
+    assert not result.success
+    assert get_promise(database, dependent.promise_id) == current
+
+
+def test_pipeline_excludes_future_prerequisites(database):
+    now = datetime(2026, 9, 12, 10, tzinfo=timezone.utc)
+    event = NormalizedEvent(
+        event_id="api", workspace_id="T1", channel_id="C1", author_id="alice", text="Build API",
+        event_ts=f"{int((now + timedelta(hours=1)).timestamp())}.000000",
+        thread_ts=f"{int(now.timestamp())}.000000", received_at=now + timedelta(hours=1),
+    )
+    prerequisite = create_promise(database, event, AgentDecision(operation="create", action="Build API", evidence="Build API"))
+    interpret = MagicMock(return_value=AgentDecision(
+        operation="create", action="Build UI", evidence="Build UI", depends_on_promise_id=prerequisite.promise_id,
+    ))
+    result = process_event(event.model_copy(update={
+        "event_id": "ui", "author_id": "bob", "text": "Build UI after API",
+        "event_ts": f"{int((now + timedelta(minutes=10)).timestamp())}.000000",
+        "received_at": now + timedelta(hours=2),
+    }), database, interpret)
+    assert result.status == "failed"
+    assert interpret.call_args.kwargs["thread_promises"] == []
+    assert list_dependent_promises(database, prerequisite.promise_id) == []
+
+
 def test_pipeline_dependency_validation(database):
     now = datetime(2026, 9, 12, 10, tzinfo=timezone.utc)
     ev = NormalizedEvent(

@@ -130,6 +130,12 @@ def execute_tool(database: sqlite3.Connection, action: UserAction, require_card:
             else:
                 changes["status"] = "confirmed"
                 notification = "Promise confirmed."
+                if prerequisite:
+                    changes["last_event_at"] = max(changes["last_event_at"], prerequisite.last_event_at)
+                    if promise.relative_deadline_seconds and promise.deadline_at is None:
+                        changes["deadline_at"] = prerequisite.last_event_at + timedelta(
+                            seconds=promise.relative_deadline_seconds,
+                        )
         else:
             changes["status"] = "confirmed"
             notification = "Promise confirmed."
@@ -161,7 +167,10 @@ def execute_tool(database: sqlite3.Connection, action: UserAction, require_card:
         notification = "Promise completed."
         for dependent in list_dependent_promises(database, promise.promise_id):
             if dependent.status == "waiting":
-                dep_changes: dict = {"status": "confirmed", "updated_at": now}
+                dep_changes: dict = {
+                    "status": "confirmed", "updated_at": now,
+                    "last_event_at": max(dependent.last_event_at, action.occurred_at.astimezone(timezone.utc)),
+                }
                 if dependent.relative_deadline_seconds and dependent.deadline_at is None:
                     dep_deadline = action.occurred_at.astimezone(timezone.utc) + timedelta(
                         seconds=dependent.relative_deadline_seconds,

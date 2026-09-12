@@ -42,6 +42,7 @@ def process_event(
     )
     thread_promises = list_thread_open_promises(
         database, event.workspace_id, event.channel_id, event.thread_ts or event.event_ts,
+        before=event.occurred_at,
     )
     try:
         try:

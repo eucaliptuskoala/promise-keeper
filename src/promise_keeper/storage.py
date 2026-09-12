@@ -79,8 +79,9 @@ def list_open_promises(
 
 def list_thread_open_promises(
     database: sqlite3.Connection, workspace_id: str, channel_id: str, thread_ts: str,
+    before: datetime | None = None,
 ) -> list[PromiseRecord]:
-    """Retrieve all open promises in the thread from any team member as potential prerequisites."""
+    """Retrieve eligible prerequisites, including completed promises, before the source event."""
     rows = database.execute(
         "SELECT record_json FROM promises WHERE workspace_id = ? AND channel_id = ?",
         (workspace_id, channel_id),
@@ -89,9 +90,12 @@ def list_thread_open_promises(
     return sorted(
         (
             promise for promise in promises
-            if promise.thread_ts == thread_ts and promise.status in ("pending_confirmation", "waiting", "confirmed")
+            if promise.thread_ts == thread_ts
+            and promise.status in ("pending_confirmation", "waiting", "confirmed", "completed")
+            and (before is None or promise.source_occurred_at < before)
         ),
-        key=lambda promise: promise.created_at,
+        key=lambda promise: promise.source_occurred_at,
+        reverse=True,
     )[:20]
 
 
