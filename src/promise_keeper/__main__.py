@@ -19,7 +19,6 @@ from promise_keeper.storage import (
 
     bind_card,
     claim_stats_command,
-    get_channel_dominant_language,
     get_last_monthly_report,
     get_monthly_missed_deadline_stats,
     get_monthly_report_attempts,
@@ -108,9 +107,6 @@ def main(argv: list[str] | None = None) -> None:
                 with database:
                     return claim_stats_command(database, workspace_id, event_id, channel_id, datetime.now(timezone.utc))
 
-        def get_channel_language(workspace_id: str, channel_id: str) -> str:
-            with closing(initialize_storage(settings.database_path)) as database:
-                return get_channel_dominant_language(database, workspace_id, channel_id)
 
         def tick() -> None:
             now = datetime.now(timezone.utc)
@@ -160,7 +156,7 @@ def main(argv: list[str] | None = None) -> None:
             bot_token=settings.slack_bot_token, app_token=settings.slack_app_token,
             process_event_fn=process, handle_action_fn=handle_action, enabled_channels=settings.enabled_channels,
             record_delivery_fn=acknowledge_delivery, record_reminder_fn=acknowledge_reminder, tick_fn=tick,
-            stats_fn=get_stats, claim_stats_fn=claim_stats, channel_language_fn=get_channel_language,
+            stats_fn=get_stats, claim_stats_fn=claim_stats,
         )
 
 

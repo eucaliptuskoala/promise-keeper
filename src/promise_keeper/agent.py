@@ -45,6 +45,7 @@ def _interpret_message(
         "If multiple promises match, clarify. Never confirm a pending promise through ordinary prose. "
         "Do not infer completion from another person's message. Ignore ordinary discussion. "
         "Use ignore_message for ordinary discussion and ask_clarification for unclear matches. "
+        "If the model cannot decide the language, the fallback should only be in English. "
         "Supply every declared argument, using null for an unknown deadline."
     )
     candidates = thread_promises or []

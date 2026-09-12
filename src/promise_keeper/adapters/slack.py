@@ -193,27 +193,16 @@ def build_reminder_card(notification: ReminderNotification, source_url: str | No
     return blocks
 
 
-def _detect_dominant_language(stats: list[LeaderboardEntry]) -> str:
-    actions = [action for entry in stats for action in entry.get("sample_actions", [])]
-    if not actions:
-        return "en"
-    ru_count = sum(1 for action in actions if re.search(r"[\u0400-\u04FF]", action))
-    return "ru" if ru_count > len(actions) / 2 else "en"
-
-
 def build_leaderboard_card(
-    stats: list[LeaderboardEntry], is_monthly: bool = False, language: str | None = None,
+    stats: list[LeaderboardEntry], is_monthly: bool = False,
 ) -> list[dict[str, Any]]:
     """Build Slack Block Kit representation for unfulfilled commitments leaderboard."""
-    lang = language or _detect_dominant_language(stats)
-    if lang == "ru":
-        title = "*Ежемесячный отчёт по сорванным дедлайнам* :trophy:" if is_monthly else "*Доска фуфлыжников (Анти-топ сорванных дедлайнов)* :trophy:"
-        subtitle = "Итоги месяца по невыполненным обязательствам в канале." if is_monthly else "Текущий список участников с просроченными обещаниями."
-        empty_text = ":tada: *Все молодцы!* В этом канале нет сорванных дедлайнов. Все обещания закрыты вовремя."
+    if is_monthly:
+        title = "*Monthly Missed Deadlines Report* :trophy:"
+        subtitle = "Monthly summary of unfulfilled commitments in this channel."
     else:
-        title = "*Monthly Missed Deadlines Report* :trophy:" if is_monthly else "*Wall of Shame (Overdue Commitments)* :trophy:"
-        subtitle = "Monthly summary of unfulfilled commitments in this channel." if is_monthly else "Current list of members with overdue promises."
-        empty_text = ":tada: *Great job, everyone!* There are no missed deadlines in this channel. All commitments were completed on time."
+        title = "*Wall of Shame (Overdue Commitments)* :trophy:"
+        subtitle = "Current list of members with overdue promises."
 
     blocks: list[dict[str, Any]] = [
         {
@@ -232,7 +221,7 @@ def build_leaderboard_card(
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": empty_text,
+                    "text": ":tada: *Great job, everyone!* There are no missed deadlines in this channel. All commitments were completed on time.",
                 },
             }
         )
@@ -243,23 +232,11 @@ def build_leaderboard_card(
     for rank, entry in enumerate(stats, start=1):
         medal = medals[rank - 1] if rank <= 3 else "🔹"
         count = entry["overdue_count"]
-        if lang == "ru":
-            if count % 10 == 1 and count % 100 != 11:
-                word = "просроченное обещание"
-            elif 2 <= count % 10 <= 4 and (count % 100 < 10 or count % 100 >= 20):
-                word = "просроченных обещания"
-            else:
-                word = "просроченных обещаний"
-            sample = ""
-            if entry.get("sample_actions"):
-                action_escaped = escape(entry["sample_actions"][0], quote=False)[:100]
-                sample = f"\n    _«{action_escaped}»_"
-        else:
-            word = "overdue commitment" if count == 1 else "overdue commitments"
-            sample = ""
-            if entry.get("sample_actions"):
-                action_escaped = escape(entry["sample_actions"][0], quote=False)[:100]
-                sample = f"\n    _\"{action_escaped}\"_"
+        word = "overdue commitment" if count == 1 else "overdue commitments"
+        sample = ""
+        if entry.get("sample_actions"):
+            action_escaped = escape(entry["sample_actions"][0], quote=False)[:100]
+            sample = f"\n    _\"{action_escaped}\"_"
 
         lines.append(f"{medal} *{rank}.* <@{entry['owner_id']}> — *{count}* {word}{sample}")
 
@@ -290,7 +267,6 @@ class SlackAdapter:
         tick_fn: Callable[[], None] | None = None,
         stats_fn: Callable[[str, str], list[LeaderboardEntry]] | None = None,
         claim_stats_fn: Callable[[str, str, str], bool] | None = None,
-        channel_language_fn: Callable[[str, str], str] | None = None,
         format_leaderboard_fn: Callable[[list[LeaderboardEntry], bool], list[dict[str, Any]]] | None = None,
     ) -> None:
         self.process_event_fn = process_event_fn
@@ -301,7 +277,6 @@ class SlackAdapter:
         self.tick_fn = tick_fn
         self.stats_fn = stats_fn
         self.claim_stats_fn = claim_stats_fn
-        self.channel_language_fn = channel_language_fn
         self.format_leaderboard_fn = format_leaderboard_fn
         self._processing_lock = RLock()
 
@@ -418,19 +393,16 @@ class SlackAdapter:
         return False
 
     def send_channel_leaderboard(
-        self, channel_id: str, stats: list[LeaderboardEntry], is_monthly: bool = True, language: str | None = None,
+        self, channel_id: str, stats: list[LeaderboardEntry], is_monthly: bool = True,
     ) -> str | None:
         if channel_id not in self.enabled_channels:
             return None
-        lang = language or (self.channel_language_fn(self.workspace_id, channel_id) if self.channel_language_fn else None)
         if self.format_leaderboard_fn:
             blocks = self.format_leaderboard_fn(stats, is_monthly)
         else:
-            blocks = build_leaderboard_card(stats, is_monthly=is_monthly, language=lang)
+            blocks = build_leaderboard_card(stats, is_monthly=is_monthly)
         fallback_text = (
-            ("Ежемесячный отчёт по сорванным дедлайнам" if is_monthly else "Доска фуфлыжников (Анти-топ сорванных дедлайнов)")
-            if lang == "ru"
-            else ("Monthly Missed Deadlines Report" if is_monthly else "Wall of Shame (Overdue Commitments)")
+            "Monthly Missed Deadlines Report" if is_monthly else "Wall of Shame (Overdue Commitments)"
         )
         try:
             response = self.app.client.chat_postMessage(
@@ -458,16 +430,11 @@ class SlackAdapter:
             if self.claim_stats_fn and not self.claim_stats_fn(self.workspace_id, stats_event_id, channel_id):
                 return
             stats = self.stats_fn(self.workspace_id, channel_id) if self.stats_fn else []
-            lang = self.channel_language_fn(self.workspace_id, channel_id) if self.channel_language_fn else None
             if self.format_leaderboard_fn:
                 blocks = self.format_leaderboard_fn(stats, False)
             else:
-                blocks = build_leaderboard_card(stats, is_monthly=False, language=lang)
-            fallback_text = (
-                "Доска фуфлыжников (Анти-топ сорванных дедлайнов)"
-                if lang == "ru"
-                else "Wall of Shame (Overdue Commitments)"
-            )
+                blocks = build_leaderboard_card(stats, is_monthly=False)
+            fallback_text = "Wall of Shame (Overdue Commitments)"
             try:
                 self.app.client.chat_postMessage(
                     channel=channel_id,
