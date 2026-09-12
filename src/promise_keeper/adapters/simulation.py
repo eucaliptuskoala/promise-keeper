@@ -8,7 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from promise_keeper.agent import interpret_message
+from promise_keeper.agent import run_agent
 from promise_keeper.config import load_settings
 from promise_keeper.models import AgentDecision, ContextMessage, NormalizedEvent, UserAction
 from promise_keeper.pipeline import handle_user_action, process_event
@@ -61,9 +61,9 @@ def run_simulation(live_model: bool = False) -> None:
         with closing(initialize_storage(path)) as database:
             promise_id = None
             for event in events:
-                result = process_event(event, database, lambda source, promises: interpret_message(
-                    source, promises, client, settings.openai_model, settings.default_timezone,
-                ) if live_model else scripted[source.event_id])
+                result = run_agent(
+                    event, database, client, settings.openai_model, settings.default_timezone,
+                ) if live_model else process_event(event, database, lambda source, promises: scripted[source.event_id])
                 print(f"{event.author_id}: {result.status}")
                 if result.status == "failed":
                     raise SystemExit(f"Simulation failed: {result.error_code}")

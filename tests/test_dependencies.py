@@ -7,11 +7,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from promise_keeper.adapters.slack import build_promise_card
-from promise_keeper.models import AgentDecision, NormalizedEvent, PromiseCardData, UserAction
+from promise_keeper.models import ActionResult, AgentDecision, NormalizedEvent, PromiseCardData, UserAction
 from promise_keeper.pipeline import handle_user_action, process_event
 from promise_keeper.reminders import check_reminders
 from promise_keeper.storage import (
     get_promise,
+    get_processed_event,
     has_dependency_cycle,
     initialize_storage,
     list_dependent_promises,
@@ -116,6 +117,7 @@ def test_dependency_lifecycle_and_unblocking(database):
     with database:
         bind_card(database, "T1", "C1", "100.000001", p1.promise_id)
         bind_card(database, "T1", "C1", "101.000001", p2.promise_id)
+        bind_card(database, "T1", "D2", "102.000001", p2.promise_id)
 
     # 5. Alice completes P1 -> unblocks P2!
     action_complete_p1 = UserAction(
@@ -138,9 +140,46 @@ def test_dependency_lifecycle_and_unblocking(database):
     stored_p2_after = get_promise(database, p2.promise_id)
     assert stored_p2_after.status == "confirmed"
     assert stored_p2_after.deadline_at is not None
-    assert len(res_comp1.unblocked_card_updates) == 1
+    assert len(res_comp1.unblocked_card_updates) == 2
     assert res_comp1.unblocked_card_updates[0].promise_card.promise_id == p2.promise_id
     assert res_comp1.unblocked_card_updates[0].message_ts == "101.000001"
+    for channel_id, message_ts in (("C1", "101.000001"), ("D2", "102.000001")):
+        effect = get_processed_event(database, "T1", "comp1", f"card_update:{channel_id}:{message_ts}")
+        assert effect["delivery_state"] == "pending"
+        assert ActionResult.model_validate_json(effect["result_json"]).updated_card.promise_id == p2.promise_id
+
+
+def test_language_completion_queues_unblocked_public_and_private_cards(database):
+    now = datetime(2026, 9, 12, 10, tzinfo=timezone.utc)
+    event = NormalizedEvent(
+        event_id="prerequisite", workspace_id="T1", channel_id="C1", author_id="alice", text="Build API",
+        event_ts=f"{int(now.timestamp())}.000001", received_at=now,
+    )
+    prerequisite = create_promise(database, event, AgentDecision(operation="create", action="Build API", evidence="Build API"))
+    dependent = create_promise(
+        database, event.model_copy(update={"event_id": "dependent", "author_id": "bob", "text": "Build UI"}),
+        AgentDecision(operation="create", action="Build UI", evidence="Build UI", depends_on_promise_id=prerequisite.promise_id),
+    )
+    for promise in (prerequisite, dependent):
+        assert execute_tool(database, UserAction(
+            action_name="confirm", promise_id=promise.promise_id, actor_id=promise.owner_id, workspace_id="T1",
+            event_id="confirm:" + promise.promise_id, channel_id="C1", message_ts="100.000001",
+            occurred_at=now + timedelta(seconds=1), received_at=now + timedelta(seconds=1),
+        )).success
+    with database:
+        bind_card(database, "T1", "C1", "101.000001", dependent.promise_id)
+        bind_card(database, "T1", "D2", "102.000001", dependent.promise_id)
+    done = event.model_copy(update={
+        "event_id": "language-complete", "text": "API is done", "event_ts": f"{int(now.timestamp()) + 60}.000001",
+        "received_at": now + timedelta(minutes=1),
+    })
+    decision = AgentDecision(operation="complete", promise_id=prerequisite.promise_id, evidence="API is done")
+    assert process_event(done, database, lambda *_: decision).promise_card.status == "completed"
+    for channel_id, message_ts in (("C1", "101.000001"), ("D2", "102.000001")):
+        effect = get_processed_event(database, "T1", done.event_id, f"card_update:{channel_id}:{message_ts}")
+        card = ActionResult.model_validate_json(effect["result_json"]).updated_card
+        assert effect["delivery_state"] == "pending"
+        assert card.promise_id == dependent.promise_id and card.owner_id == "bob" and card.status == "confirmed"
 
 
 def test_waiting_dependent_cannot_complete_before_prerequisite(database):
@@ -277,6 +316,114 @@ def test_confirm_when_prerequisite_already_completed(database):
     assert res.updated_card.status == "confirmed"
 
 
+@pytest.mark.parametrize("created_after_completion", [False, True])
+def test_late_confirmation_uses_completed_prerequisite_deadline(database, created_after_completion):
+    now = datetime(2026, 9, 12, 10, tzinfo=timezone.utc)
+    event = NormalizedEvent(
+        event_id="api", workspace_id="T1", channel_id="C1", author_id="alice",
+        text="Build API", event_ts=f"{int(now.timestamp())}.000000", received_at=now,
+    )
+    prerequisite = create_promise(database, event, AgentDecision(operation="create", action="Build API", evidence="Build API"))
+    assert execute_tool(database, UserAction(
+        action_name="confirm", promise_id=prerequisite.promise_id, actor_id="alice", workspace_id="T1",
+        event_id="confirm-api", channel_id="C1", message_ts=event.event_ts, occurred_at=now, received_at=now,
+    )).success
+    completed_at = now + timedelta(hours=1)
+    created_at = now + timedelta(hours=2) if created_after_completion else now + timedelta(minutes=2)
+    dependent_event = event.model_copy(update={
+        "event_id": "ui", "author_id": "bob", "text": "Build UI within 2 days after API",
+        "event_ts": f"{int(created_at.timestamp())}.000000", "thread_ts": event.event_ts,
+        "received_at": now + timedelta(hours=3),
+    })
+    interpret = MagicMock(return_value=AgentDecision(
+        operation="create", action="Build UI", evidence="Build UI", deadline_text="within 2 days",
+        depends_on_promise_id=prerequisite.promise_id, relative_deadline_seconds=172800,
+    ))
+    if not created_after_completion:
+        database.commit()
+        dependent = process_event(dependent_event, database, interpret).promise_card
+    assert execute_tool(database, UserAction(
+        action_name="complete", promise_id=prerequisite.promise_id, actor_id="alice", workspace_id="T1",
+        event_id="complete-api", channel_id="C1", message_ts=event.event_ts,
+        occurred_at=completed_at, received_at=now + timedelta(hours=3),
+    )).success
+    if created_after_completion:
+        database.commit()
+        dependent = process_event(dependent_event, database, interpret).promise_card
+    assert dependent is not None
+    result = execute_tool(database, UserAction(
+        action_name="confirm", promise_id=dependent.promise_id, actor_id="bob", workspace_id="T1",
+        event_id="confirm-ui", channel_id="C1", message_ts=dependent_event.event_ts,
+        occurred_at=now + timedelta(hours=4), received_at=now + timedelta(hours=5),
+    ))
+    assert result.success
+    assert result.updated_card.deadline_at == completed_at + timedelta(days=2)
+    send = MagicMock(return_value=True)
+    check_reminders(database, send, completed_at + timedelta(days=2, seconds=1), "T1", frozenset({"C1"}))
+    send.assert_called_once()
+
+
+@pytest.mark.parametrize("rescheduled", [False, True])
+def test_unblocking_preserves_causal_order(database, rescheduled):
+    now = datetime(2026, 9, 12, 10, tzinfo=timezone.utc)
+    event = NormalizedEvent(
+        event_id="api", workspace_id="T1", channel_id="C1", author_id="alice",
+        text="Build API", event_ts=f"{int(now.timestamp())}.000000", received_at=now,
+    )
+    prerequisite = create_promise(database, event, AgentDecision(operation="create", action="Build API", evidence="Build API"))
+    dependent = create_promise(database, event.model_copy(update={"event_id": "ui", "author_id": "bob"}), AgentDecision(
+        operation="create", action="Build UI", evidence="Build API", depends_on_promise_id=prerequisite.promise_id,
+    ))
+    for promise in (prerequisite, dependent):
+        assert execute_tool(database, UserAction(
+            action_name="confirm", promise_id=promise.promise_id, actor_id=promise.owner_id, workspace_id="T1",
+            event_id=f"confirm-{promise.owner_id}", channel_id="C1", message_ts=event.event_ts,
+            occurred_at=now, received_at=now,
+        )).success
+    if rescheduled:
+        assert execute_tool(database, UserAction(
+            action_name="reschedule", promise_id=dependent.promise_id, actor_id="bob", workspace_id="T1",
+            event_id="reschedule-ui", channel_id="C1", message_ts=event.event_ts,
+            occurred_at=now + timedelta(hours=2), received_at=now + timedelta(hours=2),
+            deadline_at=now + timedelta(days=1),
+        )).success
+    assert execute_tool(database, UserAction(
+        action_name="complete", promise_id=prerequisite.promise_id, actor_id="alice", workspace_id="T1",
+        event_id="complete-api", channel_id="C1", message_ts=event.event_ts,
+        occurred_at=now + timedelta(hours=1), received_at=now + timedelta(hours=3),
+    )).success
+    current = get_promise(database, dependent.promise_id)
+    assert current.last_event_at == now + timedelta(hours=2 if rescheduled else 1)
+    result = execute_tool(database, UserAction(
+        action_name="complete", promise_id=dependent.promise_id, actor_id="bob", workspace_id="T1",
+        event_id="delayed-ui", channel_id="C1", message_ts=event.event_ts,
+        occurred_at=now + timedelta(minutes=30), received_at=now + timedelta(hours=4),
+    ))
+    assert not result.success
+    assert get_promise(database, dependent.promise_id) == current
+
+
+def test_pipeline_excludes_future_prerequisites(database):
+    now = datetime(2026, 9, 12, 10, tzinfo=timezone.utc)
+    event = NormalizedEvent(
+        event_id="api", workspace_id="T1", channel_id="C1", author_id="alice", text="Build API",
+        event_ts=f"{int((now + timedelta(hours=1)).timestamp())}.000000",
+        thread_ts=f"{int(now.timestamp())}.000000", received_at=now + timedelta(hours=1),
+    )
+    prerequisite = create_promise(database, event, AgentDecision(operation="create", action="Build API", evidence="Build API"))
+    interpret = MagicMock(return_value=AgentDecision(
+        operation="create", action="Build UI", evidence="Build UI", depends_on_promise_id=prerequisite.promise_id,
+    ))
+    result = process_event(event.model_copy(update={
+        "event_id": "ui", "author_id": "bob", "text": "Build UI after API",
+        "event_ts": f"{int((now + timedelta(minutes=10)).timestamp())}.000000",
+        "received_at": now + timedelta(hours=2),
+    }), database, interpret)
+    assert result.status == "failed"
+    assert interpret.call_args.kwargs["thread_promises"] == []
+    assert list_dependent_promises(database, prerequisite.promise_id) == []
+
+
 def test_pipeline_dependency_validation(database):
     now = datetime(2026, 9, 12, 10, tzinfo=timezone.utc)
     ev = NormalizedEvent(
@@ -305,7 +452,8 @@ def test_build_promise_card_waiting_state():
         depends_on_action="Build backend API",
         deadline_text="TBD",
     )
-    blocks = build_promise_card(card)
+    assert len(build_promise_card(card)) == 1
+    blocks = build_promise_card(card, show_controls=True)
     text = blocks[0]["text"]["text"]
     assert "Waiting on prerequisite" in text
     assert "Prerequisite:* Build backend API" in text

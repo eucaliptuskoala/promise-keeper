@@ -12,10 +12,10 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import ValidationError
 
-from promise_keeper.agent import interpret_message
+from promise_keeper.agent import run_agent
 from promise_keeper.config import load_settings
-from promise_keeper.models import ActionResult, AgentDecision, NormalizedEvent, PipelineResult, PromiseRecord, UserAction
-from promise_keeper.pipeline import handle_user_action, process_event
+from promise_keeper.models import ActionResult, NormalizedEvent, PipelineResult, UserAction
+from promise_keeper.pipeline import handle_user_action
 from promise_keeper.reminders import check_reminders
 from promise_keeper.storage import (
 
@@ -55,8 +55,15 @@ def main(argv: list[str] | None = None) -> None:
     except (ValidationError, ValueError):
         logger.error("Invalid configuration. Check required keys, MODEL_TIMEOUT_SECONDS and APP_TIMEZONE.")
         raise SystemExit(1) from None
-    if not settings.slack_bot_token or not settings.slack_app_token or not settings.enabled_channels:
-        logger.error("SLACK_BOT_TOKEN, SLACK_APP_TOKEN and SLACK_ENABLED_CHANNELS are required.")
+    missing = [
+        name for name, value in (
+            ("SLACK_BOT_TOKEN", settings.slack_bot_token),
+            ("SLACK_APP_TOKEN", settings.slack_app_token),
+            ("SLACK_ENABLED_CHANNELS", settings.enabled_channels),
+        ) if not value
+    ]
+    if missing:
+        logger.error("Missing configuration: %s.", ", ".join(missing))
         raise SystemExit(1)
 
     from promise_keeper.adapters.slack import SlackAdapter
@@ -68,23 +75,14 @@ def main(argv: list[str] | None = None) -> None:
         timeout=settings.model_timeout_seconds,
         max_retries=0,
     ) as client:
-        def interpret(
-            event: NormalizedEvent,
-            promises: list[PromiseRecord],
-            thread_promises: list[PromiseRecord] | None = None,
-        ) -> AgentDecision:
-            return interpret_message(
-                event, promises, client, settings.openai_model, settings.default_timezone, thread_promises=thread_promises,
-            )
-
         def process(event: NormalizedEvent) -> PipelineResult:
             with closing(initialize_storage(settings.database_path)) as database:
-                return process_event(event, database, interpret)
+                return run_agent(event, database, client, settings.openai_model, settings.default_timezone)
 
         def handle_action(action: UserAction) -> ActionResult:
             with closing(initialize_storage(settings.database_path)) as database:
                 promise = get_promise(database, action.promise_id)
-                if promise is None or promise.channel_id not in settings.enabled_channels:
+                if promise is None or promise.channel_id not in adapter.enabled_channels:
                     return ActionResult(success=False, error_message="Promise not found in an enabled channel.")
                 return handle_user_action(action, database)
 
@@ -107,7 +105,7 @@ def main(argv: list[str] | None = None) -> None:
             current_month_key = now.strftime("%Y-%m")
             with closing(initialize_storage(settings.database_path)) as database:
                 for row in pending_responses(database, adapter.workspace_id, now):
-                    if row["kind"] == "message":
+                    if row["kind"] in ("message", "owner_card"):
                         result = PipelineResult.model_validate_json(row["result_json"])
                         card = result.promise_card
                     else:
@@ -115,22 +113,25 @@ def main(argv: list[str] | None = None) -> None:
                         card = result.updated_card
                     if card:
                         promise = get_promise(database, card.promise_id)
-                        if promise is None or promise.channel_id not in settings.enabled_channels:
+                        if promise is None or promise.channel_id not in adapter.enabled_channels:
                             continue
-                        updates = {"promise_card" if row["kind"] == "message" else "updated_card": promise.card()}
+                        updates = {"promise_card" if row["kind"] in ("message", "owner_card") else "updated_card": promise.card()}
                         result = type(result).model_validate({**result.model_dump(), **updates})
-                    elif row["channel_id"] not in settings.enabled_channels:
+                    elif row["channel_id"] not in adapter.enabled_channels:
                         continue
                     message_ts = adapter.deliver_result(row["channel_id"], row["target_ts"], row["kind"], result)
                     record_delivery(
                         database, adapter.workspace_id, row["event_id"], row["kind"], message_ts, now,
                     )
-                check_reminders(database, adapter.send_owner_reminder, now, adapter.workspace_id, settings.enabled_channels)
-                for channel_id in settings.enabled_channels:
+                check_reminders(database, adapter.send_owner_reminder, now, adapter.workspace_id, adapter.enabled_channels)
+                for channel_id in adapter.enabled_channels:
                     if channel_id == "*":
                         continue
                     last_month = get_last_monthly_report(database, adapter.workspace_id, channel_id)
-                    if last_month != current_month_key:
+                    if last_month is None:
+                        with database:
+                            record_monthly_report(database, adapter.workspace_id, channel_id, current_month_key, now)
+                    elif last_month != current_month_key:
                         stats = get_unfulfilled_stats(database, adapter.workspace_id, channel_id, now)
                         delivered = adapter.send_channel_leaderboard(channel_id, stats, is_monthly=True)
                         if delivered:

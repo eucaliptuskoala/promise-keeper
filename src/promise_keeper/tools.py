@@ -4,6 +4,8 @@ import sqlite3
 import uuid
 from datetime import timedelta, timezone
 
+from openai.types.chat import ChatCompletionFunctionToolParam
+
 from promise_keeper.models import ActionResult, AgentDecision, NormalizedEvent, PromiseRecord, UserAction
 from promise_keeper.storage import (
     get_promise,
@@ -12,6 +14,58 @@ from promise_keeper.storage import (
     record_history,
     save_promise,
 )
+
+
+MODEL_TOOL_DEFINITIONS = {
+    "create_promise": (
+        "create", "Create the author's firm commitment, pending owner confirmation.",
+        ("action", "evidence", "deadline_text", "deadline_at", "depends_on_promise_id", "relative_deadline_seconds"),
+    ),
+    "complete_promise": (
+        "complete", "Complete one clearly matched confirmed promise owned by the author.",
+        ("promise_id", "evidence"),
+    ),
+    "reschedule_promise": (
+        "reschedule", "Change one confirmed promise's deadline using explicit source wording.",
+        ("promise_id", "evidence", "deadline_text", "deadline_at"),
+    ),
+    "ignore_message": ("ignore", "Ignore discussion or messages without an accepted commitment.", ()),
+    "ask_clarification": ("clarify", "Ask one concise question when the promise or update is ambiguous.", ("clarification",)),
+}
+
+
+def model_tools() -> list[ChatCompletionFunctionToolParam]:
+    """Expose only language arguments; trusted scope stays in the pipeline."""
+    properties = AgentDecision.model_json_schema()["properties"]
+    tools: list[ChatCompletionFunctionToolParam] = []
+    for name, (operation, description, fields) in MODEL_TOOL_DEFINITIONS.items():
+        arguments = {}
+        for field in fields:
+            schema = {key: value for key, value in properties[field].items() if key != "default"}
+            if not (operation == "create" and field in (
+                "deadline_text", "deadline_at", "depends_on_promise_id", "relative_deadline_seconds",
+            )) and "anyOf" in schema:
+                variants = [variant for variant in schema.pop("anyOf") if variant.get("type") != "null"]
+                if len(variants) == 1:
+                    schema.update(variants[0])
+                else:
+                    schema["anyOf"] = variants
+            arguments[field] = schema
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": arguments,
+                    "required": list(fields),
+                    "additionalProperties": False,
+                },
+            },
+        })
+    return tools
 
 
 def create_promise(database: sqlite3.Connection, event: NormalizedEvent, decision: AgentDecision) -> PromiseRecord:
@@ -76,6 +130,12 @@ def execute_tool(database: sqlite3.Connection, action: UserAction, require_card:
             else:
                 changes["status"] = "confirmed"
                 notification = "Promise confirmed."
+                if prerequisite:
+                    changes["last_event_at"] = max(changes["last_event_at"], prerequisite.last_event_at)
+                    if promise.relative_deadline_seconds and promise.deadline_at is None:
+                        changes["deadline_at"] = prerequisite.last_event_at + timedelta(
+                            seconds=promise.relative_deadline_seconds,
+                        )
         else:
             changes["status"] = "confirmed"
             notification = "Promise confirmed."
@@ -107,15 +167,22 @@ def execute_tool(database: sqlite3.Connection, action: UserAction, require_card:
         notification = "Promise completed."
         for dependent in list_dependent_promises(database, promise.promise_id):
             if dependent.status == "waiting":
-                dep_changes: dict = {"status": "confirmed", "updated_at": now}
+                dep_changes: dict = {
+                    "status": "confirmed", "updated_at": now,
+                    "last_event_at": max(dependent.last_event_at, action.occurred_at.astimezone(timezone.utc)),
+                }
                 if dependent.relative_deadline_seconds and dependent.deadline_at is None:
                     dep_deadline = action.occurred_at.astimezone(timezone.utc) + timedelta(
                         seconds=dependent.relative_deadline_seconds,
                     )
                     dep_changes["deadline_at"] = dep_deadline
-                    days = dependent.relative_deadline_seconds // 86400
-                    hours = dependent.relative_deadline_seconds // 3600
-                    dep_changes["deadline_text"] = f"Within {days} days" if dependent.relative_deadline_seconds % 86400 == 0 else f"Within {hours} hours"
+                    secs = dependent.relative_deadline_seconds
+                    if secs % 86400 == 0:
+                        dep_changes["deadline_text"] = f"Within {secs // 86400} days"
+                    elif secs >= 3600:
+                        dep_changes["deadline_text"] = f"Within {secs // 3600} hours"
+                    else:
+                        dep_changes["deadline_text"] = f"Within {secs // 60} minutes"
                 updated_dep = PromiseRecord.model_validate({**dependent.model_dump(), **dep_changes})
                 save_promise(database, updated_dep)
                 record_history(

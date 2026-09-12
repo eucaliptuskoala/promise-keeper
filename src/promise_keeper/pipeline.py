@@ -42,6 +42,7 @@ def process_event(
     )
     thread_promises = list_thread_open_promises(
         database, event.workspace_id, event.channel_id, event.thread_ts or event.event_ts,
+        before=event.occurred_at,
     )
     try:
         try:
@@ -95,6 +96,14 @@ def process_event(
             action_result = execute_tool(database, action)
             if action_result.success:
                 result = PipelineResult(promise_card=action_result.updated_card)
+                for card in action_result.unblocked_cards:
+                    for location in list_delivered_cards(database, card.promise_id):
+                        record_processed_event(
+                            database, event.workspace_id, event.event_id,
+                            f"card_update:{location['channel_id']}:{location['message_ts']}", event.author_id,
+                            location["channel_id"], location["message_ts"], ActionResult(success=True, updated_card=card),
+                            event.received_at,
+                        )
             else:
                 result = PipelineResult(thread_reply_text=action_result.error_message)
         record_processed_event(
@@ -142,6 +151,13 @@ def handle_user_action(action: UserAction, database: sqlite3.Connection) -> Acti
                 for location in list_delivered_cards(database, card.promise_id)
             )
             result = result.model_copy(update={"unblocked_card_updates": card_updates})
+            for update in card_updates:
+                record_processed_event(
+                    database, action.workspace_id, action.event_id,
+                    f"card_update:{update.channel_id}:{update.message_ts}", action.actor_id,
+                    update.channel_id, update.message_ts, ActionResult(success=True, updated_card=update.promise_card),
+                    action.received_at,
+                )
         record_processed_event(
             database, action.workspace_id, action.event_id, "action", action.actor_id,
             action.channel_id, action.message_ts, result, action.received_at,

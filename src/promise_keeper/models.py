@@ -60,6 +60,8 @@ class PromiseCardData(BaseModel):
     deadline_text: str | None = Field(default=None, max_length=1000)
     deadline_at: AwareDatetime | None = None
     status: Literal["pending_confirmation", "waiting", "confirmed", "completed", "dismissed"] = "pending_confirmation"
+    channel_id: str | None = None
+    source_message_id: str | None = None
     depends_on_promise_id: str | None = Field(default=None, min_length=1)
     depends_on_action: str | None = Field(default=None, max_length=2000)
     relative_deadline_seconds: int | None = Field(default=None, gt=0)
@@ -190,8 +192,10 @@ class ReminderNotification(BaseModel):
     owner_id: str = Field(min_length=1)
     action: str = Field(min_length=1, max_length=2000)
     deadline_text: str | None = None
+    deadline_at: AwareDatetime | None = None
     channel_id: str
     thread_ts: str
+    source_message_id: str | None = None
 
 
 class AgentDecision(BaseModel):

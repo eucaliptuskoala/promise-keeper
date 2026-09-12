@@ -141,6 +141,10 @@ def test_snooze_and_one_private_reminder(database, action, event) -> None:
     now = event.received_at + timedelta(hours=3)
     send = MagicMock(return_value=True)
     assert check_reminders(database, send, now, "T1", ("C1",)) == 1
+    notification = send.call_args.args[0]
+    assert notification.deadline_at == event.received_at.replace(hour=12)
+    assert notification.source_message_id == event.event_ts
+    assert notification.channel_id == event.channel_id
     assert check_reminders(database, send, now + timedelta(minutes=1), "T1", ("C1",)) == 0
     snooze = action.model_copy(update={"action_name": "snooze", "event_id": "snooze", "occurred_at": now, "received_at": now})
     deadline = get_promise(database, action.promise_id).deadline_at
@@ -218,6 +222,7 @@ def test_model_failure_does_not_suppress_recovery(database, event, interpret) ->
 def test_delivery_failure_does_not_create_a_new_promise(database, event, interpret) -> None:
     result = process_event(event, database, interpret)
     record_delivery(database, "T1", event.event_id, "message", None, event.received_at)
+    record_delivery(database, "T1", event.event_id, "owner_card", "1789207202.000001", event.received_at)
     assert process_event(event, database, interpret).status == "duplicate"
     assert not pending_responses(database, "T1", event.received_at + timedelta(seconds=29))
     pending = pending_responses(database, "T1", event.received_at + timedelta(seconds=30))
@@ -225,6 +230,20 @@ def test_delivery_failure_does_not_create_a_new_promise(database, event, interpr
     assert PipelineResult.model_validate_json(pending[0]["result_json"]).promise_card.promise_id == result.promise_card.promise_id
     record_delivery(database, "T1", event.event_id, "message", "1789207201.000001", event.received_at + timedelta(seconds=30))
     assert not pending_responses(database, "T1", event.received_at + timedelta(days=1))
+
+
+def test_language_update_keeps_one_pending_owner_card(database, event, action) -> None:
+    assert handle_user_action(action, database).success
+    now = action.received_at + timedelta(minutes=1)
+    update = event.model_copy(update={
+        "event_id": "language-complete", "text": "I sent the designs", "event_ts": f"{int(now.timestamp())}.000001",
+        "received_at": now,
+    })
+    decision = AgentDecision(operation="complete", promise_id=action.promise_id, evidence="I sent the designs")
+    assert process_event(update, database, lambda *_: decision).promise_card.status == "completed"
+    effects = pending_responses(database, "T1", now)
+    assert sum(row["kind"] == "owner_card" for row in effects) == 1
+    assert any(row["kind"].startswith("card_update:C1:") for row in effects)
 
 
 def test_contextual_acceptance_uses_same_core(database, event) -> None:
