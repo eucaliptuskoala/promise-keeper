@@ -2,7 +2,7 @@
 
 Promise Keeper tracks commitments in ordinary Slack messages. An owner confirms each detected promise before reminders become eligible.
 
-The core supports creation, dismissal, completion, deadline changes, and reminder snooze. SQLite preserves agreements, history, event receipts and delivery state. Promise dependencies remain future work.
+The core supports creation, dismissal, completion, deadline changes, reminder snooze, and dependencies. A confirmed dependent waits until its prerequisite is completed; relative deadlines begin when that completion occurs. SQLite preserves agreements, history, event receipts and delivery state.
 
 ## Run locally
 
@@ -34,4 +34,4 @@ Public cards show the promise and its status without buttons. The owner receives
 
 Selected messages, bounded context and relevant commitments go to the configured model provider; its retention policy is not established here. SQLite stores normalized agreements and effects, not full conversation context. Environment files and conventional database/sidecar paths are excluded from Git. Existing databases are never automatically reset.
 
-The application must remain running for reminders and retries. Private reminders normally send once until snooze or reschedule. Outbound failures have at most three attempts; a crash after external delivery can still cause duplicates. Bot-token access to older full thread history is limited; fallback retrieves the parent and uses bounded in-memory context. Message edits/deletions, multiple processes sharing a database and dependencies are outside this MVP. See [PLAN.md](PLAN.md) for the exact contract, data flow and recovery limits.
+The application must remain running for reminders and retries. Private reminders normally send once until snooze or reschedule. Outbound failures have at most three attempts; a crash after external delivery can still cause duplicates. Bot-token access to older full thread history is limited; fallback retrieves the parent and uses bounded in-memory context. Message edits/deletions and multiple processes sharing a database are outside this MVP. See [PLAN.md](PLAN.md) for the exact contract, data flow and recovery limits.

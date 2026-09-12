@@ -15,6 +15,7 @@ from promise_keeper.tools import MODEL_TOOL_DEFINITIONS, model_tools
 
 def _interpret_message(
     event: NormalizedEvent, promises: list[PromiseRecord], client: OpenAI, model: str, timezone_name: str,
+    thread_promises: list[PromiseRecord] | None = None,
 ) -> AgentDecision:
     """Require one native function call; no prose or JSON-mode fallback."""
     instructions = (
@@ -31,12 +32,16 @@ def _interpret_message(
         "For date-only deadlines use the end of that date in the configured timezone. "
         "Every non-null deadline_at must be ISO 8601 with an explicit UTC offset (for example +02:00) or Z. "
         "Never return a naive datetime. "
+        "If the commitment depends on another person or task being done first (e.g. 'after X', 'once Y is ready'), "
+        "match to candidate_dependencies and set depends_on_promise_id. If a relative timeframe is stated "
+        "(e.g. 'within 2 days after that'), set relative_deadline_seconds (e.g. 172800 for 2 days) and leave deadline_at null. "
         "Complete or reschedule only one clearly matched confirmed promise from the supplied records. "
         "If multiple promises match, clarify. Never confirm a pending promise through ordinary prose. "
         "Do not infer completion from another person's message. Ignore ordinary discussion. "
         "Use ignore_message for ordinary discussion and ask_clarification for unclear matches. "
         "Supply every declared argument, using null for an unknown deadline."
     )
+    candidates = thread_promises or []
     payload = {
         "author_id": event.author_id,
         "occurred_at": event.occurred_at.astimezone(
@@ -54,6 +59,15 @@ def _interpret_message(
                 "deadline_at": promise.deadline_at.isoformat() if promise.deadline_at else None,
             }
             for promise in promises
+        ],
+        "candidate_dependencies": [
+            {
+                "promise_id": promise.promise_id,
+                "owner_id": promise.owner_id,
+                "action": promise.action,
+                "status": promise.status,
+            }
+            for promise in candidates
         ],
     }
     messages: list[ChatCompletionMessageParam] = [
@@ -89,7 +103,9 @@ def run_agent(
     event: NormalizedEvent, database: sqlite3.Connection, client: OpenAI, model: str, timezone_name: str,
 ) -> PipelineResult:
     """Return the committed pipeline result without a model acknowledgement."""
-    def interpret(source: NormalizedEvent, promises: list[PromiseRecord]) -> AgentDecision:
-        return _interpret_message(source, promises, client, model, timezone_name)
+    def interpret(
+        source: NormalizedEvent, promises: list[PromiseRecord], thread_promises: list[PromiseRecord] | None = None,
+    ) -> AgentDecision:
+        return _interpret_message(source, promises, client, model, timezone_name, thread_promises)
 
     return process_event(event, database, interpret)

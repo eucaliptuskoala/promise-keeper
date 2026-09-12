@@ -21,6 +21,7 @@ def initialize_storage(path: str) -> sqlite3.Connection:
             record_json TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS promise_scope ON promises(workspace_id, channel_id, owner_id);
+        CREATE INDEX IF NOT EXISTS promise_dependency ON promises(json_extract(record_json, '$.depends_on_promise_id'));
         CREATE TABLE IF NOT EXISTS promise_history (
             history_id INTEGER PRIMARY KEY,
             promise_id TEXT NOT NULL REFERENCES promises(promise_id),
@@ -70,11 +71,66 @@ def list_open_promises(
     ).fetchall()
     promises = [PromiseRecord.model_validate_json(row["record_json"]) for row in rows]
     return sorted(
-        (promise for promise in promises if promise.status in ("pending_confirmation", "confirmed")),
+        (promise for promise in promises if promise.status in ("pending_confirmation", "waiting", "confirmed")),
         key=lambda promise: (promise.thread_ts == thread_ts, promise.updated_at),
         reverse=True,
     )[:20]
 
+
+def list_thread_open_promises(
+    database: sqlite3.Connection, workspace_id: str, channel_id: str, thread_ts: str,
+) -> list[PromiseRecord]:
+    """Retrieve all open promises in the thread from any team member as potential prerequisites."""
+    rows = database.execute(
+        "SELECT record_json FROM promises WHERE workspace_id = ? AND channel_id = ?",
+        (workspace_id, channel_id),
+    ).fetchall()
+    promises = [PromiseRecord.model_validate_json(row["record_json"]) for row in rows]
+    return sorted(
+        (
+            promise for promise in promises
+            if promise.thread_ts == thread_ts and promise.status in ("pending_confirmation", "waiting", "confirmed")
+        ),
+        key=lambda promise: promise.created_at,
+    )[:20]
+
+
+def list_dependent_promises(
+    database: sqlite3.Connection, prerequisite_promise_id: str,
+) -> list[PromiseRecord]:
+    """Retrieve all promises directly blocked by the given prerequisite promise."""
+    rows = database.execute(
+        "SELECT record_json FROM promises WHERE json_extract(record_json, '$.depends_on_promise_id') = ?",
+        (prerequisite_promise_id,),
+    ).fetchall()
+    return [PromiseRecord.model_validate_json(row["record_json"]) for row in rows]
+
+
+def list_delivered_cards(database: sqlite3.Connection, promise_id: str) -> list[sqlite3.Row]:
+    """Return each Slack card currently associated with a promise."""
+    return database.execute(
+        "SELECT channel_id, message_ts FROM delivered_cards WHERE promise_id = ?",
+        (promise_id,),
+    ).fetchall()
+
+
+def has_dependency_cycle(
+    database: sqlite3.Connection, promise_id: str, candidate_dependency_id: str,
+) -> bool:
+    """Detect if setting candidate_dependency_id as a prerequisite creates a circular dependency."""
+    if promise_id == candidate_dependency_id:
+        return True
+    visited: set[str] = set()
+    current_id: str | None = candidate_dependency_id
+    while current_id and current_id not in visited:
+        visited.add(current_id)
+        prerequisite = get_promise(database, current_id)
+        if not prerequisite:
+            break
+        if prerequisite.depends_on_promise_id == promise_id:
+            return True
+        current_id = prerequisite.depends_on_promise_id
+    return False
 
 def save_promise(database: sqlite3.Connection, promise: PromiseRecord) -> None:
     """Participates in the caller's transaction."""

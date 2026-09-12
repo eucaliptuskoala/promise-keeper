@@ -59,9 +59,12 @@ class PromiseCardData(BaseModel):
     action: str = Field(min_length=1, max_length=2000)
     deadline_text: str | None = Field(default=None, max_length=1000)
     deadline_at: AwareDatetime | None = None
-    status: Literal["pending_confirmation", "confirmed", "completed", "dismissed"] = "pending_confirmation"
+    status: Literal["pending_confirmation", "waiting", "confirmed", "completed", "dismissed"] = "pending_confirmation"
     channel_id: str | None = None
     source_message_id: str | None = None
+    depends_on_promise_id: str | None = Field(default=None, min_length=1)
+    depends_on_action: str | None = Field(default=None, max_length=2000)
+    relative_deadline_seconds: int | None = Field(default=None, gt=0)
 
 
 class PromiseRecord(PromiseCardData):
@@ -82,6 +85,16 @@ class PromiseRecord(PromiseCardData):
 
     def card(self) -> PromiseCardData:
         return PromiseCardData(**{name: getattr(self, name) for name in PromiseCardData.model_fields})
+
+
+class CardUpdate(BaseModel):
+    """A previously delivered card that must reflect an internal state change."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    promise_card: PromiseCardData
+    channel_id: str = Field(min_length=1)
+    message_ts: str = Field(pattern=r"^\d{1,10}\.\d{1,6}$")
 
 
 class PipelineResult(BaseModel):
@@ -150,13 +163,21 @@ class ActionResult(BaseModel):
     error_message: str | None = None
     updated_card: PromiseCardData | None = None
     notification_text: str | None = None
+    unblocked_cards: tuple[PromiseCardData, ...] = ()
+    unblocked_card_updates: tuple[CardUpdate, ...] = ()
 
     @model_validator(mode="after")
     def validate_result(self) -> "ActionResult":
         if self.success:
             if self.error_message is not None or self.updated_card is None:
                 raise ValueError("Successful actions require a card and no error")
-        elif self.error_message is None or self.updated_card is not None or self.notification_text is not None:
+        elif (
+            self.error_message is None
+            or self.updated_card is not None
+            or self.notification_text is not None
+            or self.unblocked_cards
+            or self.unblocked_card_updates
+        ):
             raise ValueError("Failed actions require an error and no successful effects")
         return self
 
@@ -189,6 +210,8 @@ class AgentDecision(BaseModel):
     deadline_text: str | None = Field(default=None, min_length=1, max_length=1000)
     deadline_at: AwareDatetime | None = None
     clarification: str | None = Field(default=None, min_length=1, max_length=2000)
+    depends_on_promise_id: str | None = Field(default=None, min_length=1)
+    relative_deadline_seconds: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def validate_decision(self) -> "AgentDecision":
@@ -212,4 +235,14 @@ class AgentDecision(BaseModel):
             self.deadline_at is not None or self.deadline_text is not None
         ):
             raise ValueError("Only create or reschedule can supply a deadline")
+        if self.depends_on_promise_id is not None:
+            if self.operation != "create":
+                raise ValueError("Dependencies can only be established on create")
+            if self.depends_on_promise_id == self.promise_id:
+                raise ValueError("A promise cannot depend on itself")
+        if self.relative_deadline_seconds is not None:
+            if self.operation != "create" or self.depends_on_promise_id is None:
+                raise ValueError("Relative deadlines require a prerequisite dependency on create")
+            if self.deadline_at is not None:
+                raise ValueError("Relative deadlines cannot also have an absolute deadline")
         return self

@@ -52,7 +52,8 @@ def client():
 @pytest.fixture
 def create_arguments():
     return {"action": "Send designs", "evidence": "I'll send designs",
-            "deadline_text": "by noon today", "deadline_at": "2026-09-12T12:00:00Z"}
+            "deadline_text": "by noon today", "deadline_at": "2026-09-12T12:00:00Z",
+            "depends_on_promise_id": None, "relative_deadline_seconds": None}
 
 
 def set_tool(client, response) -> None:
@@ -150,6 +151,8 @@ def test_create_returns_actual_committed_result_and_suppresses_duplicates(event,
     ("reschedule_promise", {"promise_id": "missing", "evidence": "I'll send designs", "deadline_text": "by noon today", "deadline_at": "2026-09-12T12:00:00Z"}),
 ])
 def test_invalid_or_ungrounded_calls_do_not_write(event, database, client, name, arguments) -> None:
+    if name == "create_promise" and set(arguments) == {"action", "evidence", "deadline_text", "deadline_at"}:
+        arguments = {**arguments, "depends_on_promise_id": None, "relative_deadline_seconds": None}
     set_tool(client, tool_response(name, arguments))
     assert run_agent(event, database, client, "configured-model", "UTC").status == "failed"
     assert database.execute("SELECT COUNT(*) FROM promises").fetchone()[0] == 0
@@ -242,3 +245,33 @@ def test_denied_pending_completion_is_reported_as_failure(event, database, clien
     assert "Confirm" in result.thread_reply_text
     assert client.chat.completions.create.call_count == 2
     assert get_promise(database, promise.promise_id).status == "pending_confirmation"
+
+
+def test_native_create_can_link_a_thread_prerequisite(event, database, client, create_arguments) -> None:
+    set_tool(client, tool_response("create_promise", create_arguments))
+    prerequisite = run_agent(event, database, client, "configured-model", "UTC").promise_card
+    dependent_event = event.model_copy(update={
+        "event_id": "dependent", "author_id": "bob", "text": "I'll send designs within 2 days after the API",
+        "thread_ts": event.event_ts, "event_ts": f"{int(event.occurred_at.timestamp()) + 60}.000001",
+    })
+    arguments = {
+        "action": "Send designs", "evidence": "I'll send designs", "deadline_text": "within 2 days",
+        "deadline_at": None, "depends_on_promise_id": prerequisite.promise_id, "relative_deadline_seconds": 172800,
+    }
+    set_tool(client, tool_response("create_promise", arguments))
+    client.chat.completions.create.reset_mock()
+    result = run_agent(dependent_event, database, client, "configured-model", "UTC")
+    assert result.promise_card.owner_id == "bob"
+    assert result.promise_card.depends_on_promise_id == prerequisite.promise_id
+    assert result.promise_card.relative_deadline_seconds == 172800
+    assert result.promise_card.deadline_at is None
+    request = client.chat.completions.create.call_args.kwargs
+    payload = json.loads(request["messages"][1]["content"])
+    assert payload["open_promises"] == []
+    assert payload["candidate_dependencies"][0]["promise_id"] == prerequisite.promise_id
+    assert payload["candidate_dependencies"][0]["owner_id"] == "alice"
+    create_schema = request["tools"][0]["function"]["parameters"]
+    assert {"depends_on_promise_id", "relative_deadline_seconds"} <= set(create_schema["required"])
+    for field in ("depends_on_promise_id", "relative_deadline_seconds"):
+        assert any(variant.get("type") == "null" for variant in create_schema["properties"][field]["anyOf"])
+    client.chat.completions.create.assert_called_once()
