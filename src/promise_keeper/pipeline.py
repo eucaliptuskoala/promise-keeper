@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from promise_keeper.models import (
     ActionResult,
     AgentDecision,
+    CardUpdate,
     NormalizedEvent,
     PipelineResult,
     PromiseRecord,
@@ -18,7 +19,10 @@ from promise_keeper.models import (
 from promise_keeper.storage import (
     get_processed_event,
     get_promise,
+    has_dependency_cycle,
     list_open_promises,
+    list_delivered_cards,
+    list_thread_open_promises,
     record_processed_event,
 )
 from promise_keeper.tools import create_promise, execute_tool
@@ -29,15 +33,22 @@ logger = logging.getLogger("promise_keeper.pipeline")
 def process_event(
     event: NormalizedEvent,
     database: sqlite3.Connection,
-    interpret: Callable[[NormalizedEvent, list[PromiseRecord]], AgentDecision],
+    interpret: Callable[..., AgentDecision],
 ) -> PipelineResult:
     if get_processed_event(database, event.workspace_id, event.event_id, "message"):
         return PipelineResult(status="duplicate")
     promises = list_open_promises(
         database, event.workspace_id, event.channel_id, event.author_id, event.thread_ts or event.event_ts,
     )
+    thread_promises = list_thread_open_promises(
+        database, event.workspace_id, event.channel_id, event.thread_ts or event.event_ts,
+    )
     try:
-        decision = AgentDecision.model_validate(interpret(event, promises))
+        try:
+            raw_decision = interpret(event, promises, thread_promises=thread_promises)
+        except TypeError:
+            raw_decision = interpret(event, promises)
+        decision = AgentDecision.model_validate(raw_decision)
         if decision.operation in ("create", "complete", "reschedule"):
             if not decision.evidence.strip() or decision.evidence not in event.text:
                 raise ValueError("Ungrounded evidence")
@@ -47,9 +58,15 @@ def process_event(
                 raise ValueError("Ungrounded deadline")
         if decision.promise_id is not None and decision.promise_id not in {promise.promise_id for promise in promises}:
             raise ValueError("Out-of-scope promise")
+        if decision.depends_on_promise_id is not None:
+            if decision.depends_on_promise_id not in {promise.promise_id for promise in thread_promises}:
+                raise ValueError("Out-of-scope dependency")
+            if has_dependency_cycle(database, "", decision.depends_on_promise_id):
+                raise ValueError("Cyclic dependency")
     except (OpenAIError, ValidationError, ValueError, TimeoutError) as error:
         logger.warning("Interpretation failed for event %s (%s)", event.event_id, type(error).__name__)
         return PipelineResult(status="failed", error_code="interpretation_failed")
+
 
     with database:
         database.execute("BEGIN IMMEDIATE")
@@ -114,6 +131,17 @@ def handle_user_action(action: UserAction, database: sqlite3.Connection) -> Acti
                 )
             return previous
         result = execute_tool(database, action, require_card=True)
+        if result.success and result.unblocked_cards:
+            card_updates = tuple(
+                CardUpdate(
+                    promise_card=card,
+                    channel_id=location["channel_id"],
+                    message_ts=location["message_ts"],
+                )
+                for card in result.unblocked_cards
+                for location in list_delivered_cards(database, card.promise_id)
+            )
+            result = result.model_copy(update={"unblocked_card_updates": card_updates})
         record_processed_event(
             database, action.workspace_id, action.event_id, "action", action.actor_id,
             action.channel_id, action.message_ts, result, action.received_at,

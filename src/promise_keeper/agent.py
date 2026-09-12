@@ -10,7 +10,12 @@ from promise_keeper.models import AgentDecision, NormalizedEvent, PromiseRecord
 
 
 def interpret_message(
-    event: NormalizedEvent, promises: list[PromiseRecord], client: OpenAI, model: str, timezone_name: str,
+    event: NormalizedEvent,
+    promises: list[PromiseRecord],
+    client: OpenAI,
+    model: str,
+    timezone_name: str,
+    thread_promises: list[PromiseRecord] | None = None,
 ) -> AgentDecision:
     """The gateway must support Chat Completions JSON mode; no regex fallback."""
     instructions = (
@@ -25,11 +30,15 @@ def interpret_message(
         "If a stated date or time is materially ambiguous, create the firm commitment with deadline_at=null "
         "or ask one concise clarification. An unstated deadline has both fields null. "
         "For date-only deadlines use the end of that date in the configured timezone. "
+        "If the commitment depends on another person or task being done first (e.g. 'after X', 'once Y is ready'), "
+        "match to candidate_dependencies and set depends_on_promise_id. If a relative timeframe is stated "
+        "(e.g. 'within 2 days after that'), set relative_deadline_seconds (e.g. 172800 for 2 days) and leave deadline_at null. "
         "Complete or reschedule only one clearly matched confirmed promise from the supplied records. "
         "If multiple promises match, clarify. Never confirm a pending promise through ordinary prose. "
         "Do not infer completion from another person's message. Ignore ordinary discussion. "
         "Use null or omit unused fields."
     )
+    candidates = thread_promises or []
     payload = {
         "schema": AgentDecision.model_json_schema(),
         "author_id": event.author_id,
@@ -48,6 +57,15 @@ def interpret_message(
                 "deadline_at": promise.deadline_at.isoformat() if promise.deadline_at else None,
             }
             for promise in promises
+        ],
+        "candidate_dependencies": [
+            {
+                "promise_id": promise.promise_id,
+                "owner_id": promise.owner_id,
+                "action": promise.action,
+                "status": promise.status,
+            }
+            for promise in candidates
         ],
     }
     completion = client.chat.completions.create(

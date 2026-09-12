@@ -4,7 +4,7 @@ import pytest
 from slack_sdk.errors import SlackApiError
 
 from promise_keeper.adapters.slack import SlackAdapter, build_promise_card
-from promise_keeper.models import ActionResult, PipelineResult, PromiseCardData, ReminderNotification
+from promise_keeper.models import ActionResult, CardUpdate, PipelineResult, PromiseCardData, ReminderNotification
 
 
 @pytest.fixture
@@ -140,6 +140,21 @@ def test_unauthorized_action_does_not_update_card(adapter, body) -> None:
     adapter._handle_interactive_action(body)
     adapter.app.client.chat_update.assert_not_called()
     adapter.app.client.chat_postEphemeral.assert_called_once()
+
+
+def test_completion_updates_unblocked_dependent_cards(adapter, body, card) -> None:
+    dependent = card.model_copy(update={"promise_id": "p-2", "owner_id": "bob", "status": "confirmed"})
+    adapter.handle_action_fn.return_value = ActionResult(
+        success=True,
+        updated_card=card.model_copy(update={"status": "completed"}),
+        unblocked_card_updates=(CardUpdate(promise_card=dependent, channel_id="C1", message_ts="1789207202.000001"),),
+    )
+    body["actions"][0]["action_id"] = "promise_complete"
+
+    adapter._handle_interactive_action(body)
+
+    assert adapter.app.client.chat_update.call_count == 2
+    assert adapter.app.client.chat_update.call_args_list[1].kwargs["ts"] == "1789207202.000001"
 
 
 def test_foreign_workspace_action_is_ignored(adapter, body) -> None:

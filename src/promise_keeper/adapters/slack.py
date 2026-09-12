@@ -34,7 +34,8 @@ logger = logging.getLogger("promise_keeper.adapters.slack")
 def build_promise_card(card: PromiseCardData) -> list[dict[str, Any]]:
     """Build Slack Block Kit representation of a promise card."""
     status_display = {
-        "pending_confirmation": "Pending Confirmation :hourglass_flowing_sand:",
+        "pending_confirmation": "Pending confirmation :hourglass_flowing_sand:",
+        "waiting": "Waiting on prerequisite :hourglass:",
         "confirmed": "Confirmed :white_check_mark:",
         "completed": "Completed :tada:",
         "dismissed": "Dismissed :heavy_multiplication_x:",
@@ -45,6 +46,11 @@ def build_promise_card(card: PromiseCardData) -> list[dict[str, Any]]:
     if card.deadline_text and card.deadline_at is None:
         deadline_display += " (needs clarification)"
 
+    prerequisite_line = ""
+    if card.depends_on_action:
+        prerequisite_display = escape(card.depends_on_action, quote=False)[:300]
+        prerequisite_line = f"*Prerequisite:* {prerequisite_display}\n"
+
     blocks: list[dict[str, Any]] = [
         {
             "type": "section",
@@ -54,6 +60,7 @@ def build_promise_card(card: PromiseCardData) -> list[dict[str, Any]]:
                     f"*Promise Detected* :handshake:\n"
                     f"*Owner:* <@{card.owner_id}>\n"
                     f"*Action:* {action_display}\n"
+                    f"{prerequisite_line}"
                     f"*Deadline:* {deadline_display}\n"
                     f"*Status:* {status_display}"
                 ),
@@ -70,6 +77,24 @@ def build_promise_card(card: PromiseCardData) -> list[dict[str, Any]]:
                     "text": {"type": "plain_text", "text": "Confirm"},
                     "style": "primary",
                     "action_id": "promise_confirm",
+                    "value": card.promise_id,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Dismiss"},
+                    "style": "danger",
+                    "action_id": "promise_dismiss",
+                    "value": card.promise_id,
+                },
+            ]
+        )
+    elif card.status == "waiting":
+        elements.extend(
+            [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Change deadline"},
+                    "action_id": "promise_reschedule",
                     "value": card.promise_id,
                 },
                 {
@@ -102,6 +127,7 @@ def build_promise_card(card: PromiseCardData) -> list[dict[str, Any]]:
 
     if elements:
         blocks.append({"type": "actions", "elements": elements})
+
 
     return blocks
 
@@ -387,6 +413,14 @@ class SlackAdapter:
                 self.app.client.chat_postEphemeral(
                     channel=action.channel_id, user=action.actor_id, text=result.notification_text,
                 )
+            for update in result.unblocked_card_updates:
+                self.deliver_result(
+                    update.channel_id,
+                    update.message_ts,
+                    "action",
+                    ActionResult(success=True, updated_card=update.promise_card),
+                )
+
         else:
             self.app.client.chat_postEphemeral(
                 channel=action.channel_id, user=action.actor_id, text=result.error_message,

@@ -55,8 +55,14 @@ def main(argv: list[str] | None = None) -> None:
         timeout=settings.model_timeout_seconds,
         max_retries=0,
     ) as client:
-        def interpret(event: NormalizedEvent, promises: list[PromiseRecord]) -> AgentDecision:
-            return interpret_message(event, promises, client, settings.openai_model, settings.default_timezone)
+        def interpret(
+            event: NormalizedEvent,
+            promises: list[PromiseRecord],
+            thread_promises: list[PromiseRecord] | None = None,
+        ) -> AgentDecision:
+            return interpret_message(
+                event, promises, client, settings.openai_model, settings.default_timezone, thread_promises=thread_promises,
+            )
 
         def process(event: NormalizedEvent) -> PipelineResult:
             with closing(initialize_storage(settings.database_path)) as database:
