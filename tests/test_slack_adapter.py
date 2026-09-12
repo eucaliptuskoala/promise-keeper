@@ -41,9 +41,19 @@ def test_card_buttons_match_lifecycle(card) -> None:
     pending = build_promise_card(card)
     assert [button["action_id"] for button in pending[1]["elements"]] == ["promise_confirm", "promise_dismiss"]
     confirmed = build_promise_card(card.model_copy(update={"status": "confirmed"}))
-    assert [button["action_id"] for button in confirmed[1]["elements"]] == ["promise_complete", "promise_reschedule", "promise_snooze"]
+    assert [button["action_id"] for button in confirmed[1]["elements"]] == ["promise_complete", "promise_reschedule"]
     assert len(build_promise_card(card.model_copy(update={"status": "completed"}))) == 1
     assert len(build_promise_card(card.model_copy(update={"status": "dismissed"}))) == 1
+
+
+def test_reminder_card_has_snooze_button() -> None:
+    from promise_keeper.adapters.slack import build_reminder_card
+    notification = ReminderNotification(
+        promise_id="p-1", workspace_id="T1", owner_id="alice", action="Send designs", channel_id="C1",
+        thread_ts="1789207200.000001",
+    )
+    reminder_blocks = build_reminder_card(notification)
+    assert [button["action_id"] for button in reminder_blocks[1]["elements"]] == ["promise_complete", "promise_snooze"]
 
 
 def test_untrusted_card_text_cannot_inject_mentions(card) -> None:
@@ -157,6 +167,25 @@ def test_reschedule_submission_passes_typed_deadline(adapter, card) -> None:
     action = adapter.handle_action_fn.call_args.args[0]
     assert action.action_name == "reschedule"
     assert action.deadline_at.timestamp() == 1789293600
+
+
+def test_reschedule_modal_validation_errors(adapter) -> None:
+    view_calls = [call for call in adapter.app.view.call_args_list if call.args and call.args[0] == "promise_reschedule_submit"]
+    assert view_calls, "promise_reschedule_submit handler not registered"
+    decorator = adapter.app.view.return_value
+    on_reschedule_fn = decorator.call_args.args[0]
+
+    # 1. Missing date
+    mock_ack = MagicMock()
+    body_missing = {"view": {"state": {"values": {"deadline": {"deadline_at": {"selected_date_time": None}}}}}}
+    on_reschedule_fn(mock_ack, body_missing)
+    mock_ack.assert_called_once_with(response_action="errors", errors={"deadline": "Please select a date and time."})
+
+    # 2. Date in the past
+    mock_ack.reset_mock()
+    body_past = {"view": {"state": {"values": {"deadline": {"deadline_at": {"selected_date_time": 1000000000}}}}}}
+    on_reschedule_fn(mock_ack, body_past)
+    mock_ack.assert_called_once_with(response_action="errors", errors={"deadline": "Deadline must be in the future."})
 
 
 def test_private_delivery_records_card_and_never_falls_back_publicly(adapter) -> None:

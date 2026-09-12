@@ -97,12 +97,6 @@ def build_promise_card(card: PromiseCardData) -> list[dict[str, Any]]:
                     "action_id": "promise_reschedule",
                     "value": card.promise_id,
                 },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Snooze 1 hour"},
-                    "action_id": "promise_snooze",
-                    "value": card.promise_id,
-                },
             ]
         )
 
@@ -191,8 +185,7 @@ class SlackAdapter:
         @self.app.event("message")
         def on_message(event: dict[str, Any], body: dict[str, Any]) -> None:
             try:
-                with self._processing_lock:
-                    self._handle_inbound_message(event, body.get("event_id"))
+                self._handle_inbound_message(event, body.get("event_id"))
             except Exception as error:
                 logger.error("Message processing failed (%s)", type(error).__name__)
 
@@ -200,17 +193,30 @@ class SlackAdapter:
         def on_promise_action(ack: Callable[[], None], body: dict[str, Any]) -> None:
             ack()
             try:
-                with self._processing_lock:
-                    self._handle_interactive_action(body)
+                self._handle_interactive_action(body)
             except Exception as error:
                 logger.error("Action processing failed (%s)", type(error).__name__)
 
         @self.app.view("promise_reschedule_submit")
-        def on_reschedule(ack: Callable[[], None], body: dict[str, Any]) -> None:
+        def on_reschedule(ack: Callable[..., None], body: dict[str, Any]) -> None:
+            view = body.get("view", {})
+            values = view.get("state", {}).get("values", {})
+            selected = (
+                values.get("deadline", {})
+                .get("deadline_at", {})
+                .get("selected_date_time")
+            )
+            if selected is None:
+                ack(response_action="errors", errors={"deadline": "Please select a date and time."})
+                return
+            now_ts = datetime.now(timezone.utc).timestamp()
+            if selected <= now_ts:
+                ack(response_action="errors", errors={"deadline": "Deadline must be in the future."})
+                return
+
             ack()
             try:
-                with self._processing_lock:
-                    self._handle_reschedule_submission(body)
+                self._handle_reschedule_submission(body)
             except Exception as error:
                 logger.error("Deadline processing failed (%s)", type(error).__name__)
 
@@ -275,15 +281,17 @@ class SlackAdapter:
             channel_id=channel_id, author_id=user_id, text=event["text"], event_ts=event_ts,
             thread_ts=thread_ts, context_messages=tuple(reversed(bounded)),
         )
-        result = self.process_event_fn(normalized)
-        unique[event_ts] = ContextMessage(user_id=user_id, text=event["text"], ts=event_ts)
-        self._context[key] = tuple(sorted(unique.values(), key=lambda message: Decimal(message.ts))[-20:])
-        self._context.move_to_end(key)
-        if len(self._context) > 100:
-            self._context.popitem(last=False)
+        with self._processing_lock:
+            result = self.process_event_fn(normalized)
+            unique[event_ts] = ContextMessage(user_id=user_id, text=event["text"], ts=event_ts)
+            self._context[key] = tuple(sorted(unique.values(), key=lambda message: Decimal(message.ts))[-20:])
+            self._context.move_to_end(key)
+            if len(self._context) > 100:
+                self._context.popitem(last=False)
         if result.should_respond:
             delivered_ts = self.deliver_result(channel_id, thread_ts or event_ts, "message", result)
-            self.record_delivery_fn(normalized.event_id, "message", delivered_ts)
+            with self._processing_lock:
+                self.record_delivery_fn(normalized.event_id, "message", delivered_ts)
 
     def deliver_result(
         self, channel_id: str, target_ts: str, kind: str, result: PipelineResult | ActionResult,
@@ -355,7 +363,7 @@ class SlackAdapter:
         metadata = json.loads(view["private_metadata"])
         selected = view["state"]["values"]["deadline"]["deadline_at"]["selected_date_time"]
         if selected is None:
-            raise ValueError("Deadline was not selected")
+            return
         now = datetime.now(timezone.utc)
         action = UserAction(
             action_name="reschedule", promise_id=metadata["promise_id"], actor_id=body["user"]["id"],
@@ -369,10 +377,12 @@ class SlackAdapter:
         self._dispatch_action(action)
 
     def _dispatch_action(self, action: UserAction) -> None:
-        result = self.handle_action_fn(action)
+        with self._processing_lock:
+            result = self.handle_action_fn(action)
         if result.success:
             delivered_ts = self.deliver_result(action.channel_id, action.message_ts, "action", result)
-            self.record_delivery_fn(action.event_id, "action", delivered_ts)
+            with self._processing_lock:
+                self.record_delivery_fn(action.event_id, "action", delivered_ts)
             if result.notification_text:
                 self.app.client.chat_postEphemeral(
                     channel=action.channel_id, user=action.actor_id, text=result.notification_text,
@@ -397,7 +407,8 @@ class SlackAdapter:
             )
             if not message.get("ts"):
                 return False
-            self.record_reminder_fn(notification.promise_id, channel_id, message["ts"])
+            with self._processing_lock:
+                self.record_reminder_fn(notification.promise_id, channel_id, message["ts"])
             return True
         except SlackApiError as error:
             logger.warning("Private reminder delivery failed (%s)", error.response.get("error", "slack_error"))
@@ -409,8 +420,7 @@ class SlackAdapter:
     def _run_ticks(self) -> None:
         while not self._stopped.wait(30):
             try:
-                with self._processing_lock:
-                    self.tick_fn()
+                self.tick_fn()
             except Exception as error:
                 logger.error("Periodic check failed (%s)", type(error).__name__)
 
