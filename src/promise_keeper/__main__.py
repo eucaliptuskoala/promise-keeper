@@ -17,7 +17,6 @@ from promise_keeper.models import ActionResult, LeaderboardEntry, NormalizedEven
 from promise_keeper.pipeline import handle_user_action
 from promise_keeper.reminders import check_reminders
 from promise_keeper.storage import (
-
     bind_card,
     claim_stats_command,
     get_last_monthly_report,
@@ -26,6 +25,7 @@ from promise_keeper.storage import (
     get_promise,
     get_unfulfilled_stats,
     initialize_storage,
+    open_storage,
     pending_responses,
     record_delivery,
     record_monthly_report,
@@ -79,32 +79,32 @@ def main(argv: list[str] | None = None) -> None:
         max_retries=0,
     ) as client:
         def process(event: NormalizedEvent) -> PipelineResult:
-            with closing(initialize_storage(settings.database_path)) as database:
+            with closing(open_storage(settings.database_path)) as database:
                 return run_agent(event, database, client, settings.openai_model, settings.default_timezone)
 
         def handle_action(action: UserAction) -> ActionResult:
-            with closing(initialize_storage(settings.database_path)) as database:
+            with closing(open_storage(settings.database_path)) as database:
                 promise = get_promise(database, action.promise_id)
                 if promise is None or promise.channel_id not in adapter.enabled_channels:
                     return ActionResult(success=False, error_message="Promise not found in an enabled channel.")
                 return handle_user_action(action, database)
 
         def acknowledge_delivery(event_id: str, kind: str, message_ts: str | None) -> None:
-            with closing(initialize_storage(settings.database_path)) as database:
+            with closing(open_storage(settings.database_path)) as database:
                 record_delivery(database, adapter.workspace_id, event_id, kind, message_ts, datetime.now(timezone.utc))
 
         def acknowledge_reminder(promise_id: str, channel_id: str, message_ts: str) -> None:
-            with closing(initialize_storage(settings.database_path)) as database:
+            with closing(open_storage(settings.database_path)) as database:
                 with database:
                     bind_card(database, adapter.workspace_id, channel_id, message_ts, promise_id)
 
         def get_stats(workspace_id: str, channel_id: str) -> list[LeaderboardEntry]:
             now = datetime.now(timezone.utc)
-            with closing(initialize_storage(settings.database_path)) as database:
+            with closing(open_storage(settings.database_path)) as database:
                 return get_unfulfilled_stats(database, workspace_id, channel_id, now)
 
         def claim_stats(workspace_id: str, event_id: str, channel_id: str) -> bool:
-            with closing(initialize_storage(settings.database_path)) as database:
+            with closing(open_storage(settings.database_path)) as database:
                 with database:
                     return claim_stats_command(database, workspace_id, event_id, channel_id, datetime.now(timezone.utc))
 
@@ -113,7 +113,7 @@ def main(argv: list[str] | None = None) -> None:
             now = datetime.now(timezone.utc)
             tz = timezone.utc if settings.default_timezone == "UTC" else ZoneInfo(settings.default_timezone)
             current_month_key = now.astimezone(tz).strftime("%Y-%m")
-            with closing(initialize_storage(settings.database_path)) as database:
+            with closing(open_storage(settings.database_path)) as database:
                 for row in pending_responses(database, adapter.workspace_id, now):
                     if row["kind"] in ("message", "owner_card"):
                         result = PipelineResult.model_validate_json(row["result_json"])
@@ -141,16 +141,21 @@ def main(argv: list[str] | None = None) -> None:
                     if last_month is None:
                         with database:
                             record_monthly_report(database, adapter.workspace_id, channel_id, current_month_key, now)
-                    elif last_month != current_month_key and get_monthly_report_attempts(
-                        database, adapter.workspace_id, channel_id, last_month,
-                    ) < 3:
-                        stats = get_monthly_missed_deadline_stats(
-                            database, adapter.workspace_id, channel_id, last_month, settings.default_timezone,
+                    elif last_month != current_month_key:
+                        attempts = get_monthly_report_attempts(
+                            database, adapter.workspace_id, channel_id, last_month,
                         )
-                        with database:
-                            record_monthly_report_attempt(database, adapter.workspace_id, channel_id, last_month, now)
-                        delivered = adapter.send_channel_leaderboard(channel_id, stats, is_monthly=True)
-                        if delivered:
+                        if attempts < 3:
+                            stats = get_monthly_missed_deadline_stats(
+                                database, adapter.workspace_id, channel_id, last_month, settings.default_timezone,
+                            )
+                            with database:
+                                record_monthly_report_attempt(database, adapter.workspace_id, channel_id, last_month, now)
+                            delivered = adapter.send_channel_leaderboard(channel_id, stats, is_monthly=True)
+                            if delivered:
+                                with database:
+                                    record_monthly_report(database, adapter.workspace_id, channel_id, current_month_key, now)
+                        else:
                             with database:
                                 record_monthly_report(database, adapter.workspace_id, channel_id, current_month_key, now)
 
@@ -165,12 +170,21 @@ def main(argv: list[str] | None = None) -> None:
         def shutdown(signum, frame) -> None:
             adapter.stop()
 
-        previous_handlers = {name: signal.signal(name, shutdown) for name in (signal.SIGINT, signal.SIGTERM)}
+        signals_to_register = [s for s in (signal.SIGINT, getattr(signal, "SIGTERM", None)) if s is not None]
+        previous_handlers = {}
+        for signum in signals_to_register:
+            try:
+                previous_handlers[signum] = signal.signal(signum, shutdown)
+            except (ValueError, OSError):
+                pass
         try:
             adapter.start()
         finally:
-            for name, handler in previous_handlers.items():
-                signal.signal(name, handler)
+            for signum, handler in previous_handlers.items():
+                try:
+                    signal.signal(signum, handler)
+                except (ValueError, OSError):
+                    pass
 
 
 if __name__ == "__main__":

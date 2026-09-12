@@ -209,6 +209,14 @@ def test_failed_delivery_is_not_reported_as_sent(adapter, card) -> None:
     adapter.record_delivery_fn.assert_called_once_with("Ev1", "message", None)
 
 
+def test_deliver_result_safe_with_action_result_without_card(adapter) -> None:
+    # Simulating an ActionResult without a card passed to deliver_result
+    action_res = ActionResult(success=False, error_message="Something failed")
+    ts = adapter.deliver_result("C1", "1789207201.000001", "message", action_res)
+    assert ts == "1789207201.000001"
+    assert adapter.app.client.chat_postMessage.call_args.kwargs["text"] == "Something failed"
+
+
 def test_context_excludes_future_bot_and_current_messages(adapter) -> None:
     adapter.app.client.conversations_replies.return_value = {"messages": [
         {"user": "bob", "text": "Can you send designs?", "ts": "1789207200.000001"},

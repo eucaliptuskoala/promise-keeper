@@ -23,7 +23,7 @@ def check_reminders(
     sent_count = 0
     for row in rows:
         promise = get_promise(database, row["promise_id"])
-        if promise.channel_id not in enabled_channels or promise.status != "confirmed" or promise.deadline_at is None:
+        if promise is None or promise.channel_id not in enabled_channels or promise.status != "confirmed" or promise.deadline_at is None:
             continue
         if promise.deadline_at >= now or promise.reminder_sent_at is not None or promise.reminder_attempts >= 3:
             continue
@@ -50,7 +50,7 @@ def check_reminders(
             delivered = False
         if delivered:
             current = get_promise(database, promise.promise_id)
-            if current.last_event_at != attempted.last_event_at or current.snoozed_until != attempted.snoozed_until:
+            if current is None or current.last_event_at != attempted.last_event_at or current.snoozed_until != attempted.snoozed_until:
                 continue
             with database:
                 save_promise(database, PromiseRecord.model_validate({**current.model_dump(), "reminder_sent_at": now}))

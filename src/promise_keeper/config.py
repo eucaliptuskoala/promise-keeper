@@ -10,11 +10,9 @@ class Settings(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     openai_api_key: str | None = Field(default=None, min_length=1, repr=False)
-    openai_base_url: str = "https://api.aptget.nl/v1"
-    openai_model: str = Field(default="qwen3.8-27b", min_length=1)
-    openai_vision_model: str = "qwen3.8-27b-vision"
-    openai_embedding_model: str = "qwen3-embeddings"
-    model_timeout_seconds: float = Field(default=20, gt=0, le=60)
+    openai_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    openai_model: str = Field(default="gemini-3.6-flash", min_length=1)
+    model_timeout_seconds: float = Field(default=20, gt=0, le=120)
     slack_bot_token: str | None = Field(default=None, min_length=1, repr=False)
     slack_app_token: str | None = Field(default=None, min_length=1, repr=False)
     enabled_channels: tuple[str, ...] = ()
@@ -46,8 +44,6 @@ def load_settings(require_model: bool = True) -> Settings:
         "openai_api_key": os.environ.get("OPENAI_API_KEY"),
         "openai_base_url": os.environ.get("OPENAI_BASE_URL"),
         "openai_model": os.environ.get("OPENAI_MODEL"),
-        "openai_vision_model": os.environ.get("OPENAI_VISION_MODEL"),
-        "openai_embedding_model": os.environ.get("OPENAI_EMBEDDING_MODEL"),
         "model_timeout_seconds": os.environ.get("MODEL_TIMEOUT_SECONDS"),
         "slack_bot_token": os.environ.get("SLACK_BOT_TOKEN") or os.environ.get("BOT_OAUTH_TOKEN"),
         "slack_app_token": os.environ.get("SLACK_APP_TOKEN") or os.environ.get("BOT_APP_TOKEN"),

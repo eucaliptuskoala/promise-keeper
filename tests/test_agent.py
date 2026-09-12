@@ -76,7 +76,6 @@ def test_model_gets_source_time_and_narrow_native_tools(event, database, client)
     tools = {tool["function"]["name"]: tool["function"] for tool in arguments["tools"]}
     assert set(tools) == {"create_promise", "complete_promise", "reschedule_promise", "ignore_message", "ask_clarification"}
     for tool in tools.values():
-        assert tool["strict"] is True
         schema = tool["parameters"]
         assert schema["additionalProperties"] is False
         assert set(schema["required"]) == set(schema["properties"])

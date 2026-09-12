@@ -8,31 +8,23 @@ def test_load_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_MODEL", raising=False)
-    monkeypatch.delenv("OPENAI_VISION_MODEL", raising=False)
-    monkeypatch.delenv("OPENAI_EMBEDDING_MODEL", raising=False)
 
     settings = load_settings()
 
-    assert settings.openai_base_url == "https://api.aptget.nl/v1"
-    assert settings.openai_model == "qwen3.8-27b"
-    assert settings.openai_vision_model == "qwen3.8-27b-vision"
-    assert settings.openai_embedding_model == "qwen3-embeddings"
+    assert settings.openai_base_url == "https://generativelanguage.googleapis.com/v1beta/openai/"
+    assert settings.openai_model == "gemini-3.6-flash"
 
 
 def test_load_settings_custom_values(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "custom-key")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://example.com/v1")
     monkeypatch.setenv("OPENAI_MODEL", "custom-model")
-    monkeypatch.setenv("OPENAI_VISION_MODEL", "custom-vision")
-    monkeypatch.setenv("OPENAI_EMBEDDING_MODEL", "custom-embeddings")
 
     settings = load_settings()
 
     assert settings.openai_api_key == "custom-key"
     assert settings.openai_base_url == "https://example.com/v1"
     assert settings.openai_model == "custom-model"
-    assert settings.openai_vision_model == "custom-vision"
-    assert settings.openai_embedding_model == "custom-embeddings"
 
 
 def test_load_settings_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -94,9 +86,15 @@ def test_windows_timezone_data_is_available(monkeypatch) -> None:
     assert load_settings().default_timezone == "Europe/Berlin"
 
 
-@pytest.mark.parametrize("timeout", ["0", "61", "not-a-number"])
+@pytest.mark.parametrize("timeout", ["0", "121", "not-a-number"])
 def test_model_timeout_is_bounded(monkeypatch, timeout) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("MODEL_TIMEOUT_SECONDS", timeout)
     with pytest.raises(ValidationError):
         load_settings()
+
+
+def test_model_timeout_accepts_valid_high_timeout(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("MODEL_TIMEOUT_SECONDS", "90")
+    assert load_settings().model_timeout_seconds == 90.0

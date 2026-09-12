@@ -258,3 +258,27 @@ def test_send_channel_leaderboard() -> None:
     assert ts_reg == "999.0001"
     assert bot.client.chat_postMessage.call_args[1]["text"] == "Wall of Shame (Overdue Commitments)"
     assert "Wall of Shame" in bot.client.chat_postMessage.call_args[1]["blocks"][0]["text"]["text"]
+
+
+def test_commitment_mentioning_stats_is_not_treated_as_stats_command() -> None:
+    adapter = SlackAdapter.__new__(SlackAdapter)
+    adapter.bot_user_id = "UBOT"
+    assert adapter.is_stats_command("!stats") is True
+    assert adapter.is_stats_command("<@UBOT> stats") is True
+    assert adapter.is_stats_command("@Promise Keeper stats please") is True
+    # Commitments mentioning stats should NOT be treated as stats command
+    assert adapter.is_stats_command("@Promise Keeper I will update stats tomorrow") is False
+    assert adapter.is_stats_command("<@UBOT> I'll send the stats by noon") is False
+    assert adapter.is_stats_command("@Promise Keeper I promise to fix the stats table") is False
+
+
+def test_open_storage_sets_wal_mode(tmp_path: Path) -> None:
+    from promise_keeper.storage import open_storage
+
+    db_path = str(tmp_path / "wal_test.db")
+    initialize_storage(db_path).close()
+
+    conn = open_storage(db_path)
+    mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    conn.close()
+    assert mode.lower() == "wal"

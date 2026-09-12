@@ -383,12 +383,16 @@ class SlackAdapter:
         return sorted(context, key=lambda message: Decimal(message.ts))
 
     def is_stats_command(self, text: str) -> bool:
-        lower = text.lower()
-        if self.bot_user_id and f"<@{self.bot_user_id.lower()}>" in lower and "stats" in lower:
-            return True
-        if "@promise keeper" in lower and "stats" in lower:
-            return True
+        lower = text.lower().strip()
         if re.search(r"^\s*!stats\b", lower):
+            return True
+        bot_mention = (
+            (self.bot_user_id and f"<@{self.bot_user_id.lower()}>" in lower)
+            or "@promise keeper" in lower
+        )
+        if bot_mention and re.search(r"\bstats\b", lower):
+            if re.search(r"\b(i'll|i will|i promise|i can|i'm going to)\b", lower):
+                return False
             return True
         return False
 
@@ -497,7 +501,7 @@ class SlackAdapter:
         self, channel_id: str, target_ts: str, kind: str, result: PipelineResult | ActionResult,
     ) -> str | None:
         card = result.promise_card if isinstance(result, PipelineResult) else result.updated_card
-        text = f"Promise {card.status}: {card.action}" if card else result.thread_reply_text
+        text = f"Promise {card.status}: {card.action}" if card else getattr(result, "thread_reply_text", getattr(result, "error_message", ""))
         try:
             source_url = None
             if kind == "owner_card":
@@ -510,7 +514,7 @@ class SlackAdapter:
             if card and channel_id.startswith("D") and card.channel_id and card.source_message_id:
                 source_url = self._get_message_permalink(card.channel_id, card.source_message_id)
             arguments: dict[str, Any] = {
-                "channel": channel_id, "text": escape(text, quote=False),
+                "channel": channel_id, "text": escape(text or "", quote=False),
             }
             if card:
                 arguments["blocks"] = build_promise_card(
@@ -670,9 +674,3 @@ class SlackAdapter:
         self.handler.close()
         if self._ticker is not None:
             self._ticker.join(timeout=5)
-
-
-def run_slack() -> None:
-    from promise_keeper.__main__ import main
-
-    main([])

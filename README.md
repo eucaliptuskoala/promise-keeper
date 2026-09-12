@@ -87,9 +87,9 @@ Configure settings via environment variables or a local `.env` file:
 | Variable | Description | Default |
 | --- | --- | --- |
 | `OPENAI_API_KEY` | API key for the model provider | Required for live bot and `--live-model` |
-| `OPENAI_BASE_URL` | Base URL for OpenAI-compatible endpoint | `https://api.aptget.nl/v1` |
-| `OPENAI_MODEL` | Model name | `qwen3.8-27b` |
-| `MODEL_TIMEOUT_SECONDS` | Timeout in seconds for model requests (1–60) | `20` (60 recommended for larger models) |
+| `OPENAI_BASE_URL` | Base URL for OpenAI-compatible endpoint | `https://generativelanguage.googleapis.com/v1beta/openai/` |
+| `OPENAI_MODEL` | Model name | `gemini-3.6-flash` |
+| `MODEL_TIMEOUT_SECONDS` | Timeout in seconds for model requests (1–120) | `20` |
 | `SLACK_BOT_TOKEN` | Slack Bot User OAuth Token (`xoxb-...`) | Required for Slack |
 | `SLACK_APP_TOKEN` | Slack App-Level Token (`xapp-...`) | Required for Slack |
 | `SLACK_ENABLED_CHANNELS` | Comma-separated channel IDs or `*` for all public channels | Required for Slack |

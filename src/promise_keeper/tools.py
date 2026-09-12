@@ -56,7 +56,6 @@ def model_tools() -> list[ChatCompletionFunctionToolParam]:
             "function": {
                 "name": name,
                 "description": description,
-                "strict": True,
                 "parameters": {
                     "type": "object",
                     "properties": arguments,

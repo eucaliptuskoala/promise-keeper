@@ -9,11 +9,19 @@ from promise_keeper.models import ActionResult, LeaderboardEntry, PipelineResult
 
 
 
-def initialize_storage(path: str) -> sqlite3.Connection:
-    """Open storage without replacing existing data. Caller closes the connection."""
+def open_storage(path: str) -> sqlite3.Connection:
+    """Open an existing database connection with WAL mode and foreign keys enabled."""
     database = sqlite3.connect(path, timeout=5)
     database.row_factory = sqlite3.Row
     database.execute("PRAGMA foreign_keys = ON")
+    if path != ":memory:":
+        database.execute("PRAGMA journal_mode = WAL")
+    return database
+
+
+def initialize_storage(path: str) -> sqlite3.Connection:
+    """Open storage without replacing existing data. Caller closes the connection."""
+    database = open_storage(path)
     database.executescript("""
         CREATE TABLE IF NOT EXISTS promises (
             promise_id TEXT PRIMARY KEY,
@@ -48,6 +56,7 @@ def initialize_storage(path: str) -> sqlite3.Connection:
             retry_at REAL NOT NULL,
             PRIMARY KEY(workspace_id, event_id, kind)
         );
+        CREATE INDEX IF NOT EXISTS pending_deliveries ON processed_events(workspace_id, delivery_state, retry_at);
         CREATE TABLE IF NOT EXISTS delivered_cards (
             workspace_id TEXT NOT NULL,
             channel_id TEXT NOT NULL,

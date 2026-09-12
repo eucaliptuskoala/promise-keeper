@@ -200,6 +200,15 @@ def test_missing_deadline_and_disabled_scope_do_not_remind(database, action, eve
     send.assert_not_called()
 
 
+def test_check_reminders_handles_none_promise_safely(database, monkeypatch) -> None:
+    database.execute("INSERT INTO promises VALUES ('corrupt', 'T1', 'C1', 'alice', '{}')")
+    send = MagicMock(return_value=True)
+    import promise_keeper.reminders
+    monkeypatch.setattr(promise_keeper.reminders, "get_promise", lambda db, pid: None)
+    now = datetime(2026, 9, 12, 10, tzinfo=timezone.utc)
+    assert check_reminders(database, send, now, "T1", ("C1",)) == 0
+
+
 @pytest.mark.parametrize("decision", [
     {"operation": "create", "action": "Send designs", "evidence": "invented"},
     {"operation": "create", "action": "Send designs", "evidence": "I'll send", "deadline_text": "tomorrow", "deadline_at": "2026-09-13T12:00:00Z"},
