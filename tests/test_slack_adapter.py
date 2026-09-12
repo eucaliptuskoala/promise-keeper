@@ -37,6 +37,55 @@ def body() -> dict:
             "actions": [{"action_id": "promise_confirm", "value": "p-1", "action_ts": "1789207260.000001"}]}
 
 
+def test_all_public_channels_use_pagination_and_exclude_other_conversations() -> None:
+    with patch("promise_keeper.adapters.slack.App") as app_class, patch("promise_keeper.adapters.slack.SocketModeHandler"):
+        app = app_class.return_value
+        app.client.auth_test.return_value = {"user_id": "bot", "team_id": "T1"}
+        app.client.conversations_list.side_effect = [
+            {"channels": [{"id": "C1", "is_channel": True, "is_private": False}],
+             "response_metadata": {"next_cursor": "page-2"}},
+            {"channels": [
+                {"id": "C2", "is_channel": True, "is_private": False},
+                {"id": "private", "is_channel": True, "is_private": True},
+                {"id": "archived", "is_channel": True, "is_archived": True},
+                {"id": "D1", "is_channel": False},
+            ], "response_metadata": {"next_cursor": ""}},
+        ]
+        instance = SlackAdapter(
+            bot_token="synthetic-bot", app_token="synthetic-app", enabled_channels=("*",),
+            process_event_fn=MagicMock(return_value=PipelineResult(status="ignored")), handle_action_fn=MagicMock(),
+            record_delivery_fn=MagicMock(), record_reminder_fn=MagicMock(),
+        )
+        assert instance.enabled_channels == ("C1", "C2")
+        assert app.client.conversations_list.call_args.kwargs["cursor"] == "page-2"
+        assert app.client.conversations_list.call_args.kwargs["types"] == "public_channel"
+        for channel_id in ("private", "archived", "D1"):
+            instance._handle_inbound_message({"channel": channel_id, "user": "alice", "text": "I'll send it", "ts": "1789207200.000001"})
+        instance.process_event_fn.assert_not_called()
+        instance._handle_inbound_message({"channel": "C2", "user": "alice", "text": "I'll send it", "ts": "1789207200.000001"})
+        instance.process_event_fn.assert_called_once()
+
+
+@pytest.mark.parametrize("failure", ["missing_scope", "empty", "pagination_limit"])
+def test_all_public_channel_lookup_fails_without_broadening_access(failure) -> None:
+    with patch("promise_keeper.adapters.slack.App") as app_class, patch("promise_keeper.adapters.slack.SocketModeHandler"):
+        app = app_class.return_value
+        app.client.auth_test.return_value = {"user_id": "bot", "team_id": "T1"}
+        if failure == "missing_scope":
+            app.client.conversations_list.side_effect = SlackApiError("synthetic", {"error": "missing_scope"})
+        else:
+            app.client.conversations_list.return_value = {
+                "channels": [], "response_metadata": {"next_cursor": "more" if failure == "pagination_limit" else ""},
+            }
+        with pytest.raises(SlackApiError if failure == "missing_scope" else ValueError):
+            SlackAdapter(
+                bot_token="synthetic-bot", app_token="synthetic-app", enabled_channels=("*",),
+                process_event_fn=MagicMock(), handle_action_fn=MagicMock(),
+                record_delivery_fn=MagicMock(), record_reminder_fn=MagicMock(),
+            )
+        assert app.client.conversations_list.call_count == (20 if failure == "pagination_limit" else 1)
+
+
 def test_card_buttons_match_lifecycle(card) -> None:
     pending = build_promise_card(card)
     assert [button["action_id"] for button in pending[1]["elements"]] == ["promise_confirm", "promise_dismiss"]

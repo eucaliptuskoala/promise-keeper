@@ -68,6 +68,19 @@ def test_enabled_channels_are_explicit(monkeypatch) -> None:
     assert load_settings().enabled_channels == ("C1", "C2")
 
 
+def test_all_public_channels_are_explicit(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("SLACK_ENABLED_CHANNELS", "*")
+    assert load_settings().enabled_channels == ("*",)
+
+
+def test_all_public_channels_cannot_mix_with_channel_ids(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("SLACK_ENABLED_CHANNELS", "*,C1")
+    with pytest.raises(ValidationError):
+        load_settings()
+
+
 def test_unknown_timezone_is_rejected(monkeypatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("APP_TIMEZONE", "Unknown/Zone")
