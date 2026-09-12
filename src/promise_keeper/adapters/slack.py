@@ -31,7 +31,9 @@ from promise_keeper.models import (
 logger = logging.getLogger("promise_keeper.adapters.slack")
 
 
-def build_promise_card(card: PromiseCardData) -> list[dict[str, Any]]:
+def build_promise_card(
+    card: PromiseCardData, *, show_controls: bool = False, source_url: str | None = None,
+) -> list[dict[str, Any]]:
     """Build Slack Block Kit representation of a promise card."""
     status_display = {
         "pending_confirmation": "Pending Confirmation :hourglass_flowing_sand:",
@@ -42,7 +44,10 @@ def build_promise_card(card: PromiseCardData) -> list[dict[str, Any]]:
 
     deadline_display = escape(card.deadline_text or "Not specified", quote=False)[:300]
     action_display = escape(card.action, quote=False)[:1800]
-    if card.deadline_text and card.deadline_at is None:
+    if card.deadline_at is not None:
+        fallback = card.deadline_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        deadline_display += f" (<!date^{int(card.deadline_at.timestamp())}^{{date_num}} {{time}}|{fallback}>)"
+    elif card.deadline_text:
         deadline_display += " (needs clarification)"
 
     blocks: list[dict[str, Any]] = [
@@ -60,6 +65,14 @@ def build_promise_card(card: PromiseCardData) -> list[dict[str, Any]]:
             },
         }
     ]
+
+    if show_controls and card.channel_id:
+        source_display = f"<#{card.channel_id}>"
+        if source_url:
+            source_display += f" · <{escape(source_url, quote=False)}|View original message>"
+        blocks[0]["text"]["text"] += f"\n*Promised in:* {source_display}"
+    if not show_controls:
+        return blocks
 
     elements: list[dict[str, Any]] = []
     if card.status == "pending_confirmation":
@@ -106,10 +119,16 @@ def build_promise_card(card: PromiseCardData) -> list[dict[str, Any]]:
     return blocks
 
 
-def build_reminder_card(notification: ReminderNotification) -> list[dict[str, Any]]:
+def build_reminder_card(notification: ReminderNotification, source_url: str | None = None) -> list[dict[str, Any]]:
     """Build Slack Block Kit representation for an overdue private reminder."""
     deadline_display = escape(notification.deadline_text or "Overdue", quote=False)[:300]
     action_display = escape(notification.action, quote=False)[:1800]
+    if notification.deadline_at is not None:
+        fallback = notification.deadline_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        deadline_display += f" (<!date^{int(notification.deadline_at.timestamp())}^{{date_num}} {{time}}|{fallback}>)"
+    source_display = f"<#{notification.channel_id}>"
+    if source_url:
+        source_display += f" · <{escape(source_url, quote=False)}|View original message>"
 
     blocks: list[dict[str, Any]] = [
         {
@@ -119,6 +138,7 @@ def build_reminder_card(notification: ReminderNotification) -> list[dict[str, An
                 "text": (
                     f"*Reminder: Overdue Commitment* :alarm_clock:\n\n"
                     f"You promised: *{action_display}*\n"
+                    f"*Promised in:* {source_display}\n"
                     f"*Deadline:* {deadline_display}\n\n"
                     f"Have you completed this delivery?"
                 ),
@@ -206,7 +226,8 @@ class SlackAdapter:
         @self.app.event("message")
         def on_message(event: dict[str, Any], body: dict[str, Any]) -> None:
             try:
-                self._handle_inbound_message(event, body.get("event_id"))
+                with self._processing_lock:
+                    self._handle_inbound_message(event, body.get("event_id"))
             except Exception as error:
                 logger.error("Message processing failed (%s)", type(error).__name__)
 
@@ -302,31 +323,59 @@ class SlackAdapter:
             channel_id=channel_id, author_id=user_id, text=event["text"], event_ts=event_ts,
             thread_ts=thread_ts, context_messages=tuple(reversed(bounded)),
         )
-        with self._processing_lock:
-            result = self.process_event_fn(normalized)
-            unique[event_ts] = ContextMessage(user_id=user_id, text=event["text"], ts=event_ts)
-            self._context[key] = tuple(sorted(unique.values(), key=lambda message: Decimal(message.ts))[-20:])
-            self._context.move_to_end(key)
-            if len(self._context) > 100:
-                self._context.popitem(last=False)
+        result = self.process_event_fn(normalized)
+        unique[event_ts] = ContextMessage(user_id=user_id, text=event["text"], ts=event_ts)
+        self._context[key] = tuple(sorted(unique.values(), key=lambda message: Decimal(message.ts))[-20:])
+        self._context.move_to_end(key)
+        if len(self._context) > 100:
+            self._context.popitem(last=False)
         if result.should_respond:
             delivered_ts = self.deliver_result(channel_id, thread_ts or event_ts, "message", result)
-            with self._processing_lock:
-                self.record_delivery_fn(normalized.event_id, "message", delivered_ts)
+            self.record_delivery_fn(normalized.event_id, "message", delivered_ts)
+            if self.tick_fn:
+                self.tick_fn()
 
     def deliver_result(
         self, channel_id: str, target_ts: str, kind: str, result: PipelineResult | ActionResult,
     ) -> str | None:
         card = result.promise_card if isinstance(result, PipelineResult) else result.updated_card
         text = f"Promise {card.status}: {card.action}" if card else result.thread_reply_text
-        arguments: dict[str, Any] = {"channel": channel_id, "text": escape(text, quote=False)}
-        if card:
-            arguments["blocks"] = build_promise_card(card)
         try:
-            if kind == "action":
+            source_url = None
+            if kind == "owner_card":
+                if card is None:
+                    return None
+                response = self.app.client.conversations_open(users=[card.owner_id])
+                channel_id = response.get("channel", {}).get("id")
+                if not channel_id or not channel_id.startswith("D"):
+                    return None
+            if card and channel_id.startswith("D") and card.channel_id and card.source_message_id:
+                try:
+                    source = self.app.client.chat_getPermalink(
+                        channel=card.channel_id, message_ts=card.source_message_id,
+                    )
+                    source_url = source.get("permalink")
+                except SlackApiError as error:
+                    logger.warning("Original message link unavailable (%s)", error.response.get("error", "slack_error"))
+                except Exception as error:
+                    logger.warning("Original message link unavailable (%s)", type(error).__name__)
+            arguments: dict[str, Any] = {
+                "channel": channel_id, "text": escape(text, quote=False),
+            }
+            if card:
+                arguments["blocks"] = build_promise_card(
+                    card, show_controls=channel_id.startswith("D"), source_url=source_url,
+                )
+            if kind == "action" or kind.startswith("card_update:"):
                 response = self.app.client.chat_update(ts=target_ts, **arguments)
+            elif kind == "owner_card":
+                response = self.app.client.chat_postMessage(unfurl_links=False, unfurl_media=False, **arguments)
+                if response.get("ts"):
+                    self.record_reminder_fn(card.promise_id, channel_id, response["ts"])
             else:
-                response = self.app.client.chat_postMessage(thread_ts=target_ts, **arguments)
+                response = self.app.client.chat_postMessage(
+                    thread_ts=target_ts, unfurl_links=False, unfurl_media=False, **arguments,
+                )
             return response.get("ts")
         except SlackApiError as error:
             logger.warning("Outbound delivery failed (%s)", error.response.get("error", "slack_error"))
@@ -400,10 +449,12 @@ class SlackAdapter:
     def _dispatch_action(self, action: UserAction) -> None:
         with self._processing_lock:
             result = self.handle_action_fn(action)
-        if result.success:
-            delivered_ts = self.deliver_result(action.channel_id, action.message_ts, "action", result)
-            with self._processing_lock:
+            if result.success:
+                delivered_ts = self.deliver_result(action.channel_id, action.message_ts, "action", result)
                 self.record_delivery_fn(action.event_id, "action", delivered_ts)
+                if self.tick_fn:
+                    self.tick_fn()
+        if result.success:
             if result.notification_text:
                 self.app.client.chat_postEphemeral(
                     channel=action.channel_id, user=action.actor_id, text=result.notification_text,
@@ -421,10 +472,23 @@ class SlackAdapter:
             channel_id = response.get("channel", {}).get("id")
             if not channel_id:
                 return False
+            source_url = None
+            if notification.source_message_id is not None:
+                try:
+                    source = self.app.client.chat_getPermalink(
+                        channel=notification.channel_id, message_ts=notification.source_message_id,
+                    )
+                    source_url = source.get("permalink")
+                except SlackApiError as error:
+                    logger.warning("Original message link unavailable (%s)", error.response.get("error", "slack_error"))
+                except Exception as error:
+                    logger.warning("Original message link unavailable (%s)", type(error).__name__)
             message = self.app.client.chat_postMessage(
                 channel=channel_id,
                 text=escape(f"Reminder: {notification.action}", quote=False),
-                blocks=build_reminder_card(notification),
+                blocks=build_reminder_card(notification, source_url),
+                unfurl_links=False,
+                unfurl_media=False,
             )
             if not message.get("ts"):
                 return False
@@ -441,7 +505,8 @@ class SlackAdapter:
     def _run_ticks(self) -> None:
         while not self._stopped.wait(30):
             try:
-                self.tick_fn()
+                with self._processing_lock:
+                    self.tick_fn()
             except Exception as error:
                 logger.error("Periodic check failed (%s)", type(error).__name__)
 

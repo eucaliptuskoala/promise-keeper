@@ -40,7 +40,7 @@ def test_application_wires_retries_controls_and_reminders(tmp_path, enabled_chan
             callbacks["record_delivery_fn"]("Ev1", "message", None)
             clock.now.return_value = now
             callbacks["tick_fn"]()
-            adapter.deliver_result.assert_called_once()
+            assert {call.args[2] for call in adapter.deliver_result.call_args_list} == {"message", "owner_card"}
             action = UserAction(
                 action_name="confirm", promise_id=promise_id, actor_id="alice", workspace_id="T1",
                 event_id="click-confirm", channel_id="C1", message_ts="1789207201.000001",

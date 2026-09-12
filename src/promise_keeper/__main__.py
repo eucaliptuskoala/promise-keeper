@@ -86,7 +86,7 @@ def main(argv: list[str] | None = None) -> None:
             now = datetime.now(timezone.utc)
             with closing(initialize_storage(settings.database_path)) as database:
                 for row in pending_responses(database, adapter.workspace_id, now):
-                    if row["kind"] == "message":
+                    if row["kind"] in ("message", "owner_card"):
                         result = PipelineResult.model_validate_json(row["result_json"])
                         card = result.promise_card
                     else:
@@ -96,7 +96,7 @@ def main(argv: list[str] | None = None) -> None:
                         promise = get_promise(database, card.promise_id)
                         if promise is None or promise.channel_id not in adapter.enabled_channels:
                             continue
-                        updates = {"promise_card" if row["kind"] == "message" else "updated_card": promise.card()}
+                        updates = {"promise_card" if row["kind"] in ("message", "owner_card") else "updated_card": promise.card()}
                         result = type(result).model_validate({**result.model_dump(), **updates})
                     elif row["channel_id"] not in adapter.enabled_channels:
                         continue

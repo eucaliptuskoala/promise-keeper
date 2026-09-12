@@ -26,7 +26,9 @@ For Slack, configure `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, and
 .\.venv\Scripts\python.exe -m promise_keeper --simulation --live-model
 ```
 
-The live-model simulation passed against the configured gateway with a 60-second timeout; creation took about 29 seconds, exceeding the default 20. The example environment sets `MODEL_TIMEOUT_SECONDS=60`. Bot authentication, public-channel listing and app-token Socket Mode access also passed. Real Slack message delivery and buttons remain unverified. Check an ordinary message without mentioning the bot, actual owner/non-owner clicks, a deadline change and private reminder delivery before relying on Slack mode.
+The live-model simulation passed against the configured gateway with a 60-second timeout; creation took about 29 seconds, exceeding the default 20. The example environment sets `MODEL_TIMEOUT_SECONDS=60`. Bot authentication, public-channel listing and app-token Socket Mode access also passed. A real Slack message produced a card, and a private overdue reminder was delivered after adjusting one existing promise for the test. Actual owner clicks verified confirmation, dismissal, deadline-modal saving and private completion on clearly labelled seeded test cards. Snooze on the existing promise deferred its reminder by one hour without changing the deadline, and delivery resumed after accelerating that wait for the test. Non-owner controls still need a live check.
+
+Public cards show the promise and its status without buttons. The owner receives controls in a private conversation with the bot; actions update both private and public cards. Cards show the original deadline wording followed by its exact date and time, localized by Slack to the viewer's device timezone. Private controls and reminders also show the source channel and a link to the original message. If link lookup fails, private delivery still proceeds with the channel reference.
 
 ## Data and limits
 

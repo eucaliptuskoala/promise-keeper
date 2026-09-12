@@ -40,8 +40,8 @@ def check_reminders(
             save_promise(database, attempted)
         notification = ReminderNotification(
             promise_id=promise.promise_id, workspace_id=promise.workspace_id, owner_id=promise.owner_id,
-            action=promise.action, deadline_text=promise.deadline_text,
-            channel_id=promise.channel_id, thread_ts=promise.thread_ts,
+            action=promise.action, deadline_text=promise.deadline_text, deadline_at=promise.deadline_at,
+            channel_id=promise.channel_id, thread_ts=promise.thread_ts, source_message_id=promise.source_message_id,
         )
         try:
             delivered = send(notification)

@@ -117,6 +117,33 @@ def record_processed_event(
         (workspace_id, event_id, kind, actor_id, channel_id, target_ts, result.model_dump_json(),
          "pending" if needs_delivery else "sent", now.timestamp()),
     )
+    card = result.promise_card if isinstance(result, PipelineResult) else result.updated_card
+    if not needs_delivery or card is None or kind not in ("message", "action"):
+        return
+    destinations = database.execute(
+        "SELECT channel_id, message_ts FROM delivered_cards WHERE workspace_id = ? AND promise_id = ?",
+        (workspace_id, card.promise_id),
+    ).fetchall()
+    pending_owner = database.execute(
+        """SELECT 1 FROM processed_events WHERE workspace_id = ? AND kind = 'owner_card'
+           AND delivery_state = 'pending' AND json_extract(result_json, '$.promise_card.promise_id') = ?""",
+        (workspace_id, card.promise_id),
+    ).fetchone()
+    has_owner_card = any(row["channel_id"] != (card.channel_id or channel_id) for row in destinations)
+    if kind == "message" and not pending_owner and not has_owner_card:
+        database.execute(
+            "INSERT INTO processed_events VALUES (?, ?, 'owner_card', ?, ?, ?, ?, 'pending', 0, ?)",
+            (workspace_id, event_id, actor_id, channel_id, target_ts, result.model_dump_json(), now.timestamp()),
+        )
+    update = ActionResult(success=True, updated_card=card)
+    for destination in destinations:
+        if kind == "action" and destination["channel_id"] == channel_id and destination["message_ts"] == target_ts:
+            continue
+        database.execute(
+            "INSERT INTO processed_events VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?)",
+            (workspace_id, event_id, f"card_update:{destination['channel_id']}:{destination['message_ts']}",
+             actor_id, destination["channel_id"], destination["message_ts"], update.model_dump_json(), now.timestamp()),
+        )
 
 
 def record_delivery(
@@ -137,7 +164,7 @@ def record_delivery(
                WHERE workspace_id = ? AND event_id = ? AND kind = ?""",
             (state, attempts, (now + timedelta(seconds=30 * attempts)).timestamp(), workspace_id, event_id, kind),
         )
-        if message_ts and card:
+        if message_ts and card and kind != "owner_card":
             bind_card(database, workspace_id, row["channel_id"], message_ts, card["promise_id"])
 
 
