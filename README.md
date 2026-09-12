@@ -1,41 +1,35 @@
 # Promise Keeper
 
-Promise Keeper is a Slack-native agent that helps teams follow through on promises made in everyday conversation.
+Promise Keeper tracks commitments in ordinary Slack messages. An owner confirms each detected promise before reminders become eligible.
 
-## Why it exists
+The core supports creation, dismissal, completion, deadline changes, and reminder snooze. SQLite preserves agreements, history, event receipts and delivery state. Promise dependencies remain future work.
 
-“I'll send it tomorrow” often disappears into a busy thread. Other people may be waiting on that delivery, but nobody creates a task or remembers to follow up. Promise Keeper turns those agreements into trackable commitments without requiring manual task entry.
+## Run locally
 
-## Planned capabilities
+Python 3.12 or newer is required:
 
-Detect real commitments rather than vague intentions or unaccepted requests. Understand short replies from conversation context and extract the owner, action, deadline when stated, and source message.
-
-Keep promises and their chronological history across restarts. Recognize later completion or deadline changes, and let owners confirm, dismiss, complete, or adjust promises through Slack controls.
-
-Follow up once on confirmed promises that become overdue.
-
-After the core lifecycle works end to end, track one simple explicit dependency and notify the waiting owner when the blocking delivery is confirmed complete.
-
-Provide a simulation mode where Alice, Bob, and Andrii use the same processing pipeline as real Slack messages.
-
-## Example
-
-```text
-Alice: I'll send the designs by noon.
-Bob: Once Alice sends them, I'll build the page by 3 pm.
-Andrii: I might look into animations.
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e '.[dev]'
+.\.venv\Scripts\python.exe -m promise_keeper --simulation
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-The required workflow should track Alice's promise, ask her to confirm it, preserve it across restart, and later complete or remind it while ignoring Andrii's vague intention. Linking Bob's dependency and notifying him after Alice finishes is a stretch workflow.
+The verified offline simulation runs Alice, Bob and Andrii through the real core using labelled scripted model decisions and a temporary synthetic database. It checks creation, confirmation, persistence after reopening SQLite, one captured private reminder and completion. It does not evaluate model understanding or deliver to Slack.
 
-## Running
+For Slack, configure `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, and comma-separated `SLACK_ENABLED_CHANNELS` in environment variables or local `.env`. Existing `BOT_OAUTH_TOKEN` and `BOT_APP_TOKEN` names are accepted. Invite the bot to enabled public channels, enable Socket Mode and interactivity, subscribe to `message.channels`, and grant bot scopes `channels:history`, `chat:write`, `im:write`, plus app-level `connections:write`.
 
-The new MVP is not runnable yet. Installation and startup commands will be added when its entry points are implemented and verified.
+`OPENAI_BASE_URL` defaults to `https://api.aptget.nl/v1`; `OPENAI_MODEL` defaults to `qwen3.8-27b`. The OpenAI SDK requests one validated JSON decision per message, with no regex or fake-key fallback. `DATABASE_PATH` defaults to `promise_keeper.db` in the working directory; `APP_TIMEZONE` defaults to `UTC`. Windows named timezones use `tzdata`. `MODEL_TIMEOUT_SECONDS` defaults to 20 and accepts values greater than 0 and at most 60.
 
-The planned local setup is one Python application using Slack Bolt with Socket Mode. Slack mode requires an installed Slack app, bot and app-level tokens, and model API access. The target model is `qwen3.8-27b` through Aptget, but authenticated completion and tool behavior have not yet been verified. Offline simulation tests will not require Slack accounts or API keys.
+```powershell
+.\.venv\Scripts\python.exe -m promise_keeper
+.\.venv\Scripts\python.exe -m promise_keeper --simulation --live-model
+```
 
-## Status
+Authenticated model generation and JSON mode remain unverified because no model key was available. Real Slack delivery is also unverified. Check an ordinary message without mentioning the bot, actual owner/non-owner clicks, a deadline change and private reminder delivery before relying on Slack mode.
 
-Early implementation stage. Model configuration exists, but the capabilities above and the Slack integration are not yet verified. Slack is the initial platform.
+## Data and limits
 
-See [PLAN.md](PLAN.md) for the implementation plan and [AGENTS.md](AGENTS.md) for coding-agent guidelines.
+Selected messages, bounded context and relevant commitments go to the configured model provider; its retention policy is not established here. SQLite stores normalized agreements and effects, not full conversation context. Environment files and conventional database/sidecar paths are excluded from Git. Existing databases are never automatically reset.
+
+The application must remain running for reminders and retries. Private reminders normally send once until snooze or reschedule. Outbound failures have at most three attempts; a crash after external delivery can still cause duplicates. Bot-token access to older full thread history is limited; fallback retrieves the parent and uses bounded in-memory context. Message edits/deletions, multiple processes sharing a database and dependencies are outside this MVP. See [PLAN.md](PLAN.md) for the exact contract, data flow and recovery limits.

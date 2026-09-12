@@ -1,17 +1,23 @@
 """Slack Bolt transport adapter with Socket Mode."""
 
+import json
 import logging
 import re
+from collections import OrderedDict
+from datetime import datetime, timezone
+from decimal import Decimal
+from html import escape
+from threading import Event, RLock, Thread
 from typing import Any, Callable
 
 from slack_bolt import App
+
 try:
     from slack_bolt.adapter.socket_mode.websocket_client import SocketModeHandler
 except ImportError:
     from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.errors import SlackApiError
 
-from promise_keeper.config import Settings, load_settings
 from promise_keeper.models import (
     ActionResult,
     ContextMessage,
@@ -21,7 +27,6 @@ from promise_keeper.models import (
     ReminderNotification,
     UserAction,
 )
-from promise_keeper.pipeline import handle_user_action, process_event
 
 logger = logging.getLogger("promise_keeper.adapters.slack")
 
@@ -35,7 +40,10 @@ def build_promise_card(card: PromiseCardData) -> list[dict[str, Any]]:
         "dismissed": "Dismissed :heavy_multiplication_x:",
     }.get(card.status, card.status)
 
-    deadline_display = card.deadline_text if card.deadline_text else "Not specified"
+    deadline_display = escape(card.deadline_text or "Not specified", quote=False)[:300]
+    action_display = escape(card.action, quote=False)[:1800]
+    if card.deadline_text and card.deadline_at is None:
+        deadline_display += " (needs clarification)"
 
     blocks: list[dict[str, Any]] = [
         {
@@ -45,7 +53,7 @@ def build_promise_card(card: PromiseCardData) -> list[dict[str, Any]]:
                 "text": (
                     f"*Promise Detected* :handshake:\n"
                     f"*Owner:* <@{card.owner_id}>\n"
-                    f"*Action:* {card.action}\n"
+                    f"*Action:* {action_display}\n"
                     f"*Deadline:* {deadline_display}\n"
                     f"*Status:* {status_display}"
                 ),
@@ -85,7 +93,13 @@ def build_promise_card(card: PromiseCardData) -> list[dict[str, Any]]:
                 },
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "Snooze"},
+                    "text": {"type": "plain_text", "text": "Change deadline"},
+                    "action_id": "promise_reschedule",
+                    "value": card.promise_id,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Snooze 1 hour"},
                     "action_id": "promise_snooze",
                     "value": card.promise_id,
                 },
@@ -100,7 +114,8 @@ def build_promise_card(card: PromiseCardData) -> list[dict[str, Any]]:
 
 def build_reminder_card(notification: ReminderNotification) -> list[dict[str, Any]]:
     """Build Slack Block Kit representation for an overdue private reminder."""
-    deadline_display = notification.deadline_text if notification.deadline_text else "Overdue"
+    deadline_display = escape(notification.deadline_text or "Overdue", quote=False)[:300]
+    action_display = escape(notification.action, quote=False)[:1800]
 
     blocks: list[dict[str, Any]] = [
         {
@@ -109,7 +124,7 @@ def build_reminder_card(notification: ReminderNotification) -> list[dict[str, An
                 "type": "mrkdwn",
                 "text": (
                     f"*Reminder: Overdue Commitment* :alarm_clock:\n\n"
-                    f"You promised: *{notification.action}*\n"
+                    f"You promised: *{action_display}*\n"
                     f"*Deadline:* {deadline_display}\n\n"
                     f"Have you completed this delivery?"
                 ),
@@ -127,7 +142,7 @@ def build_reminder_card(notification: ReminderNotification) -> list[dict[str, An
                 },
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "Snooze"},
+                    "text": {"type": "plain_text", "text": "Snooze 1 hour"},
                     "action_id": "promise_snooze",
                     "value": notification.promise_id,
                 },
@@ -138,227 +153,288 @@ def build_reminder_card(notification: ReminderNotification) -> list[dict[str, An
 
 
 class SlackAdapter:
-    """Slack transport adapter managing Socket Mode, normalization, and outbound delivery."""
+    """Normalize input and deliver core results through Slack."""
 
     def __init__(
         self,
         bot_token: str,
         app_token: str,
-        process_event_fn: Callable[[NormalizedEvent], PipelineResult] = process_event,
-        handle_action_fn: Callable[[UserAction], ActionResult] = handle_user_action,
+        process_event_fn: Callable[[NormalizedEvent], PipelineResult],
+        handle_action_fn: Callable[[UserAction], ActionResult],
+        enabled_channels: tuple[str, ...],
+        record_delivery_fn: Callable[[str, str, str | None], None],
+        record_reminder_fn: Callable[[str, str, str], None],
+        tick_fn: Callable[[], None] | None = None,
     ) -> None:
-        self.bot_token = bot_token
-        self.app_token = app_token
         self.process_event_fn = process_event_fn
         self.handle_action_fn = handle_action_fn
-
-        self.app = App(token=self.bot_token)
+        self.enabled_channels = enabled_channels
+        self.record_delivery_fn = record_delivery_fn
+        self.record_reminder_fn = record_reminder_fn
+        self.tick_fn = tick_fn
+        self._processing_lock = RLock()
+        self._stopped = Event()
+        self._ticker: Thread | None = None
+        self._context: OrderedDict[tuple[str, str], tuple[ContextMessage, ...]] = OrderedDict()
+        self.app = App(token=bot_token)
+        self.app.client.timeout = 10
+        self.app.client.retry_handlers = []
         auth = self.app.client.auth_test()
-        self.bot_user_id: str = auth.get("user_id", "")
-        self.workspace_id: str = auth.get("team_id", "")
-        self.workspace_name: str = auth.get("team", "")
-
-        logger.info(
-            "Initialized Slack adapter for workspace '%s' (bot user: %s)",
-            self.workspace_name,
-            self.bot_user_id,
-        )
-
+        self.bot_user_id = auth.get("user_id", "")
+        self.workspace_id = auth.get("team_id", "")
+        if not self.bot_user_id or not self.workspace_id:
+            raise ValueError("Slack authentication did not return bot and workspace identities")
         self._register_handlers()
-        self.handler = SocketModeHandler(self.app, self.app_token)
+        self.handler = SocketModeHandler(self.app, app_token)
 
     def _register_handlers(self) -> None:
-        """Register Bolt message and interactive action listeners."""
-
         @self.app.event("message")
-        def on_message(event: dict[str, Any], logger: logging.Logger) -> None:
-            self._handle_inbound_message(event)
+        def on_message(event: dict[str, Any], body: dict[str, Any]) -> None:
+            try:
+                with self._processing_lock:
+                    self._handle_inbound_message(event, body.get("event_id"))
+            except Exception as error:
+                logger.error("Message processing failed (%s)", type(error).__name__)
 
-        @self.app.action(re.compile(r"^promise_.*"))
+        @self.app.action(re.compile(r"^promise_(confirm|dismiss|complete|snooze|reschedule)$"))
         def on_promise_action(ack: Callable[[], None], body: dict[str, Any]) -> None:
             ack()
-            self._handle_interactive_action(body)
+            try:
+                with self._processing_lock:
+                    self._handle_interactive_action(body)
+            except Exception as error:
+                logger.error("Action processing failed (%s)", type(error).__name__)
+
+        @self.app.view("promise_reschedule_submit")
+        def on_reschedule(ack: Callable[[], None], body: dict[str, Any]) -> None:
+            ack()
+            try:
+                with self._processing_lock:
+                    self._handle_reschedule_submission(body)
+            except Exception as error:
+                logger.error("Deadline processing failed (%s)", type(error).__name__)
 
     def _fetch_thread_context(self, channel_id: str, thread_ts: str, current_ts: str) -> list[ContextMessage]:
-        """Retrieve recent conversation context within a thread."""
         try:
-            resp = self.app.client.conversations_replies(
-                channel=channel_id,
-                ts=thread_ts,
-                limit=10,
+            response = self.app.client.conversations_replies(
+                channel=channel_id, ts=thread_ts, latest=current_ts, inclusive=False, limit=20,
             )
-            raw_messages = resp.get("messages", [])
-            context: list[ContextMessage] = []
-            for msg in raw_messages:
-                # Exclude current message and bot messages from context
-                if msg.get("ts") == current_ts or msg.get("bot_id"):
-                    continue
-                user = msg.get("user")
-                text = msg.get("text", "")
-                ts = msg.get("ts", "")
-                if user and text:
-                    context.append(ContextMessage(user_id=user, text=text, ts=ts))
-            return context
-        except SlackApiError as err:
-            logger.warning("Failed to fetch thread context: %s", err.response.get("error", str(err)))
-            return []
+        except SlackApiError as error:
+            code = error.response.get("error")
+            if code not in ("missing_scope", "not_allowed_token_type"):
+                raise
+            logger.warning("Full thread history unavailable with this token; fetching the parent message")
+            response = self.app.client.conversations_history(
+                channel=channel_id, oldest=thread_ts, latest=thread_ts, inclusive=True, limit=1,
+            )
+        return self._normalize_context(response.get("messages", []), current_ts)
 
-    def _handle_inbound_message(self, event: dict[str, Any]) -> None:
-        """Normalize raw Slack event and dispatch to the shared pipeline."""
-        bot_id = event.get("bot_id")
+    def _normalize_context(self, messages: list[dict[str, Any]], current_ts: str) -> list[ContextMessage]:
+        context = []
+        for message in messages:
+            if message.get("bot_id") or message.get("subtype") or message.get("user") == self.bot_user_id:
+                continue
+            if not message.get("user") or not message.get("text", "").strip() or not message.get("ts"):
+                continue
+            if Decimal(message["ts"]) >= Decimal(current_ts):
+                continue
+            context.append(ContextMessage(user_id=message["user"], text=message["text"][:8000], ts=message["ts"]))
+        return sorted(context, key=lambda message: Decimal(message.ts))
+
+    def _handle_inbound_message(self, event: dict[str, Any], event_id: str | None = None) -> None:
         user_id = event.get("user")
-        subtype = event.get("subtype")
-
-        # Ignore bot-authored messages and self-messages
-        if bot_id or user_id == self.bot_user_id:
+        channel_id = event.get("channel")
+        if event.get("bot_id") or event.get("subtype") or user_id == self.bot_user_id:
             return
-
-        # Ignore administrative / unsupported subtypes
-        if subtype:
+        if channel_id not in self.enabled_channels or not user_id or not event.get("text", "").strip():
             return
-
-        channel_id = event.get("channel", "")
-        text = event.get("text", "")
         event_ts = event.get("ts", "")
         thread_ts = event.get("thread_ts")
-
-        # Retrieve bounded thread context if message is part of a thread
-        context_messages: list[ContextMessage] = []
-        if thread_ts and thread_ts != event_ts:
-            context_messages = self._fetch_thread_context(channel_id, thread_ts, event_ts)
-
-        normalized_event = NormalizedEvent(
-            event_id=f"{channel_id}:{event_ts}",
-            workspace_id=self.workspace_id,
-            channel_id=channel_id,
-            author_id=user_id or "",
-            text=text,
-            event_ts=event_ts,
-            thread_ts=thread_ts,
-            context_messages=context_messages,
+        key = (channel_id, thread_ts or "channel")
+        context = list(self._context.get(key, ()))
+        try:
+            if thread_ts and thread_ts != event_ts:
+                context += self._fetch_thread_context(channel_id, thread_ts, event_ts)
+            elif not context:
+                response = self.app.client.conversations_history(
+                    channel=channel_id, latest=event_ts, inclusive=False, limit=20,
+                )
+                context += self._normalize_context(response.get("messages", []), event_ts)
+        except SlackApiError as error:
+            logger.warning("Context retrieval failed (%s)", error.response.get("error", "slack_error"))
+        unique = {message.ts: message for message in context if Decimal(message.ts) < Decimal(event_ts)}
+        bounded = []
+        remaining = 16000
+        for message in sorted(unique.values(), key=lambda message: Decimal(message.ts), reverse=True)[:20]:
+            if len(message.text) > remaining:
+                break
+            bounded.append(message)
+            remaining -= len(message.text)
+        normalized = NormalizedEvent(
+            event_id=event_id or f"{channel_id}:{event_ts}", workspace_id=self.workspace_id,
+            channel_id=channel_id, author_id=user_id, text=event["text"], event_ts=event_ts,
+            thread_ts=thread_ts, context_messages=tuple(reversed(bounded)),
         )
+        result = self.process_event_fn(normalized)
+        unique[event_ts] = ContextMessage(user_id=user_id, text=event["text"], ts=event_ts)
+        self._context[key] = tuple(sorted(unique.values(), key=lambda message: Decimal(message.ts))[-20:])
+        self._context.move_to_end(key)
+        if len(self._context) > 100:
+            self._context.popitem(last=False)
+        if result.should_respond:
+            delivered_ts = self.deliver_result(channel_id, thread_ts or event_ts, "message", result)
+            self.record_delivery_fn(normalized.event_id, "message", delivered_ts)
 
-        logger.info(
-            "Normalized event from user %s in channel %s (thread: %s)",
-            user_id,
-            channel_id,
-            thread_ts or "none",
-        )
-
-        result = self.process_event_fn(normalized_event)
-        if not result.should_respond:
-            return
-
-        target_thread_ts = thread_ts or event_ts
-        if result.promise_card:
-            blocks = build_promise_card(result.promise_card)
-            fallback_text = f"Promise: {result.promise_card.action}"
-            self.app.client.chat_postMessage(
-                channel=channel_id,
-                thread_ts=target_thread_ts,
-                text=fallback_text,
-                blocks=blocks,
-            )
-        elif result.thread_reply_text:
-            self.app.client.chat_postMessage(
-                channel=channel_id,
-                thread_ts=target_thread_ts,
-                text=result.thread_reply_text,
-            )
+    def deliver_result(
+        self, channel_id: str, target_ts: str, kind: str, result: PipelineResult | ActionResult,
+    ) -> str | None:
+        card = result.promise_card if isinstance(result, PipelineResult) else result.updated_card
+        text = f"Promise {card.status}: {card.action}" if card else result.thread_reply_text
+        arguments: dict[str, Any] = {"channel": channel_id, "text": escape(text, quote=False)}
+        if card:
+            arguments["blocks"] = build_promise_card(card)
+        try:
+            if kind == "action":
+                response = self.app.client.chat_update(ts=target_ts, **arguments)
+            else:
+                response = self.app.client.chat_postMessage(thread_ts=target_ts, **arguments)
+            return response.get("ts")
+        except SlackApiError as error:
+            logger.warning("Outbound delivery failed (%s)", error.response.get("error", "slack_error"))
+            return None
+        except Exception as error:
+            logger.warning("Outbound delivery failed (%s)", type(error).__name__)
+            return None
 
     def _handle_interactive_action(self, body: dict[str, Any]) -> None:
-        """Handle interactive Block Kit button clicks with deterministic validation."""
+        if body.get("team", {}).get("id") != self.workspace_id:
+            return
         actions = body.get("actions", [])
         if not actions:
             return
-
-        action_data = actions[0]
-        action_id = action_data.get("action_id", "")
-        promise_id = action_data.get("value", "")
-        actor_id = body.get("user", {}).get("id", "")
-        channel_id = body.get("channel", {}).get("id", "")
-        message = body.get("message", {})
-        message_ts = message.get("ts", "")
-
-        # Clean action name (e.g. promise_confirm -> confirm)
-        action_name = re.sub(r"^promise_", "", action_id)
-
-        user_action = UserAction(
-            action_name=action_name,
-            promise_id=promise_id,
-            actor_id=actor_id,
-            channel_id=channel_id,
-            message_ts=message_ts,
+        payload = actions[0]
+        if payload.get("action_id") == "promise_reschedule":
+            if not payload.get("action_ts"):
+                raise ValueError("Interactive action lacks its original timestamp")
+            self.app.client.views_open(trigger_id=body["trigger_id"], view={
+                "type": "modal", "callback_id": "promise_reschedule_submit",
+                "title": {"type": "plain_text", "text": "Change deadline"},
+                "submit": {"type": "plain_text", "text": "Save"},
+                "close": {"type": "plain_text", "text": "Cancel"},
+                "private_metadata": json.dumps({
+                    "promise_id": payload["value"],
+                    "channel_id": body["channel"]["id"],
+                    "message_ts": body["message"]["ts"],
+                    "occurred_at": datetime.fromtimestamp(
+                        float(Decimal(payload["action_ts"])), timezone.utc,
+                    ).isoformat(),
+                }),
+                "blocks": [{
+                    "type": "input",
+                    "block_id": "deadline",
+                    "label": {"type": "plain_text", "text": "New deadline"},
+                    "element": {"type": "datetimepicker", "action_id": "deadline_at"},
+                }],
+            })
+            return
+        if not payload.get("action_ts"):
+            raise ValueError("Interactive action lacks its original timestamp")
+        action = UserAction(
+            action_name=re.sub(r"^promise_", "", payload.get("action_id", "")), promise_id=payload.get("value", ""),
+            actor_id=body.get("user", {}).get("id", ""), workspace_id=self.workspace_id,
+            event_id=f"{body['channel']['id']}:{body['message']['ts']}:{payload['action_id']}:{payload['action_ts']}",
+            channel_id=body["channel"]["id"], message_ts=body["message"]["ts"],
+            occurred_at=datetime.fromtimestamp(float(Decimal(payload["action_ts"])), timezone.utc),
         )
+        self._dispatch_action(action)
 
-        result = self.handle_action_fn(user_action)
+    def _handle_reschedule_submission(self, body: dict[str, Any]) -> None:
+        if body.get("team", {}).get("id") != self.workspace_id:
+            return
+        view = body["view"]
+        metadata = json.loads(view["private_metadata"])
+        selected = view["state"]["values"]["deadline"]["deadline_at"]["selected_date_time"]
+        if selected is None:
+            raise ValueError("Deadline was not selected")
+        now = datetime.now(timezone.utc)
+        action = UserAction(
+            action_name="reschedule", promise_id=metadata["promise_id"], actor_id=body["user"]["id"],
+            workspace_id=self.workspace_id, event_id=f"view:{view['id']}:{view['hash']}",
+            channel_id=metadata["channel_id"],
+            message_ts=metadata["message_ts"],
+            occurred_at=metadata["occurred_at"],
+            received_at=now,
+            deadline_at=datetime.fromtimestamp(selected, timezone.utc),
+        )
+        self._dispatch_action(action)
+
+    def _dispatch_action(self, action: UserAction) -> None:
+        result = self.handle_action_fn(action)
         if result.success:
-            if result.updated_card:
-                blocks = build_promise_card(result.updated_card)
-                fallback_text = f"Promise {result.updated_card.status}: {result.updated_card.action}"
-                self.app.client.chat_update(
-                    channel=channel_id,
-                    ts=message_ts,
-                    text=fallback_text,
-                    blocks=blocks,
+            delivered_ts = self.deliver_result(action.channel_id, action.message_ts, "action", result)
+            self.record_delivery_fn(action.event_id, "action", delivered_ts)
+            if result.notification_text:
+                self.app.client.chat_postEphemeral(
+                    channel=action.channel_id, user=action.actor_id, text=result.notification_text,
                 )
         else:
-            # Unauthorized or invalid action: inform actor ephemerally
-            error_msg = result.error_message or "You are not authorized to perform this action."
             self.app.client.chat_postEphemeral(
-                channel=channel_id,
-                user=actor_id,
-                text=error_msg,
+                channel=action.channel_id, user=action.actor_id, text=result.error_message,
             )
 
     def send_owner_reminder(self, notification: ReminderNotification) -> bool:
-        """Deliver a private overdue reminder card to the promise owner via DM."""
+        if notification.workspace_id != self.workspace_id or notification.channel_id not in self.enabled_channels:
+            return False
         try:
-            open_resp = self.app.client.conversations_open(users=[notification.owner_id])
-            dm_channel_id = open_resp.get("channel", {}).get("id")
-            if not dm_channel_id:
-                logger.error("Failed to open DM channel with user %s", notification.owner_id)
+            response = self.app.client.conversations_open(users=[notification.owner_id])
+            channel_id = response.get("channel", {}).get("id")
+            if not channel_id:
                 return False
-
-            blocks = build_reminder_card(notification)
-            fallback_text = f"Reminder: You promised to '{notification.action}'"
-            self.app.client.chat_postMessage(
-                channel=dm_channel_id,
-                text=fallback_text,
-                blocks=blocks,
+            message = self.app.client.chat_postMessage(
+                channel=channel_id,
+                text=escape(f"Reminder: {notification.action}", quote=False),
+                blocks=build_reminder_card(notification),
             )
-            logger.info("Delivered private reminder for promise %s to user %s", notification.promise_id, notification.owner_id)
+            if not message.get("ts"):
+                return False
+            self.record_reminder_fn(notification.promise_id, channel_id, message["ts"])
             return True
-        except SlackApiError as err:
-            logger.error(
-                "Failed to send private reminder to user %s: %s",
-                notification.owner_id,
-                err.response.get("error", str(err)),
-            )
+        except SlackApiError as error:
+            logger.warning("Private reminder delivery failed (%s)", error.response.get("error", "slack_error"))
+            return False
+        except Exception as error:
+            logger.warning("Private reminder delivery failed (%s)", type(error).__name__)
             return False
 
+    def _run_ticks(self) -> None:
+        while not self._stopped.wait(30):
+            try:
+                with self._processing_lock:
+                    self.tick_fn()
+            except Exception as error:
+                logger.error("Periodic check failed (%s)", type(error).__name__)
+
     def start(self) -> None:
-        """Start the Socket Mode listener."""
-        logger.info("Starting Slack Socket Mode listener...")
-        self.handler.start()
+        if self.tick_fn is not None:
+            self._ticker = Thread(target=self._run_ticks, name="promise-reminders", daemon=True)
+            self._ticker.start()
+        try:
+            self.handler.connect()
+            while not self._stopped.wait(0.5):
+                pass
+        finally:
+            self.stop()
 
     def stop(self) -> None:
-        """Stop the Socket Mode listener."""
-        logger.info("Stopping Slack Socket Mode listener...")
+        if self._stopped.is_set():
+            return
+        self._stopped.set()
         self.handler.close()
+        if self._ticker is not None:
+            self._ticker.join(timeout=5)
 
 
 def run_slack() -> None:
-    """Start the Slack Socket Mode adapter using application settings."""
-    from dotenv import load_dotenv
+    from promise_keeper.__main__ import main
 
-    load_dotenv()
-    settings = load_settings(require_model=False)
-    if not settings.slack_bot_token or not settings.slack_app_token:
-        raise ValueError("Slack bot token and app token must be configured in environment or .env")
-
-    adapter = SlackAdapter(
-        bot_token=settings.slack_bot_token,
-        app_token=settings.slack_app_token,
-    )
-    adapter.start()
+    main([])

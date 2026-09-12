@@ -95,6 +95,12 @@ celerybeat.pid
 # Environments (continued)
 *.db
 *.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
 
 # Django stuff
 *.log

@@ -38,10 +38,8 @@ def test_load_settings_custom_values(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_load_settings_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-    with pytest.raises(ValidationError) as exc_info:
+    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
         load_settings()
-
-    assert exc_info.value.errors()[0]["loc"] == ("openai_api_key",)
 
 
 def test_load_settings_slack_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -57,3 +55,35 @@ def test_load_settings_slack_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.database_path == "promise_keeper.db"
     assert settings.default_timezone == "UTC"
 
+
+def test_transport_configuration_does_not_invent_model_credentials(monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    settings = load_settings(require_model=False)
+    assert settings.openai_api_key is None
+
+
+def test_enabled_channels_are_explicit(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("SLACK_ENABLED_CHANNELS", " C1, C2, ")
+    assert load_settings().enabled_channels == ("C1", "C2")
+
+
+def test_unknown_timezone_is_rejected(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("APP_TIMEZONE", "Unknown/Zone")
+    with pytest.raises(ValidationError):
+        load_settings()
+
+
+def test_windows_timezone_data_is_available(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("APP_TIMEZONE", "Europe/Berlin")
+    assert load_settings().default_timezone == "Europe/Berlin"
+
+
+@pytest.mark.parametrize("timeout", ["0", "61", "not-a-number"])
+def test_model_timeout_is_bounded(monkeypatch, timeout) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("MODEL_TIMEOUT_SECONDS", timeout)
+    with pytest.raises(ValidationError):
+        load_settings()

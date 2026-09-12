@@ -1,45 +1,58 @@
-"""Environment-backed application configuration."""
+"""Environment-backed model, Slack and application settings."""
 
 import os
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class Settings(BaseModel):
-    """Validated model API settings."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
-    model_config = ConfigDict(frozen=True)
-
-    openai_api_key: str = Field(min_length=1)
+    openai_api_key: str | None = Field(default=None, min_length=1, repr=False)
     openai_base_url: str = "https://api.aptget.nl/v1"
-    openai_model: str = "qwen3.8-27b"
+    openai_model: str = Field(default="qwen3.8-27b", min_length=1)
     openai_vision_model: str = "qwen3.8-27b-vision"
     openai_embedding_model: str = "qwen3-embeddings"
-
-    # Slack transport settings (optional for offline testing, required for Slack adapter)
-    slack_bot_token: str | None = None
-    slack_app_token: str | None = None
-
-    # Application settings
-    database_path: str = "promise_keeper.db"
+    model_timeout_seconds: float = Field(default=20, gt=0, le=60)
+    slack_bot_token: str | None = Field(default=None, min_length=1, repr=False)
+    slack_app_token: str | None = Field(default=None, min_length=1, repr=False)
+    enabled_channels: tuple[str, ...] = ()
+    database_path: str = Field(default="promise_keeper.db", min_length=1)
     default_timezone: str = "UTC"
+
+    @field_validator("default_timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        if value != "UTC":
+            try:
+                ZoneInfo(value)
+            except ZoneInfoNotFoundError:
+                raise ValueError(
+                    "Unknown timezone or missing timezone data; configure UTC or install tzdata",
+                ) from None
+        return value
 
 
 def load_settings(require_model: bool = True) -> Settings:
-    """Load and validate application settings."""
-    openai_key = os.environ.get("OPENAI_API_KEY")
-    if not openai_key and not require_model:
-        openai_key = "slack-transport-mode"
-
     values = {
-        "openai_api_key": openai_key,
+        "openai_api_key": os.environ.get("OPENAI_API_KEY"),
         "openai_base_url": os.environ.get("OPENAI_BASE_URL"),
         "openai_model": os.environ.get("OPENAI_MODEL"),
         "openai_vision_model": os.environ.get("OPENAI_VISION_MODEL"),
         "openai_embedding_model": os.environ.get("OPENAI_EMBEDDING_MODEL"),
+        "model_timeout_seconds": os.environ.get("MODEL_TIMEOUT_SECONDS"),
         "slack_bot_token": os.environ.get("SLACK_BOT_TOKEN") or os.environ.get("BOT_OAUTH_TOKEN"),
         "slack_app_token": os.environ.get("SLACK_APP_TOKEN") or os.environ.get("BOT_APP_TOKEN"),
         "database_path": os.environ.get("DATABASE_PATH"),
         "default_timezone": os.environ.get("APP_TIMEZONE") or os.environ.get("DEFAULT_TIMEZONE"),
+        "enabled_channels": tuple(
+            channel.strip()
+            for channel in os.environ.get("SLACK_ENABLED_CHANNELS", "").split(",")
+            if channel.strip()
+        ),
     }
-    return Settings(**{key: value for key, value in values.items() if value is not None})
+    settings = Settings(**{key: value for key, value in values.items() if value is not None})
+    if require_model and settings.openai_api_key is None:
+        raise ValueError("OPENAI_API_KEY is required for model interpretation")
+    return settings

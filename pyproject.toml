@@ -12,6 +12,9 @@ dependencies = [
     "openai",
     "pydantic",
     "slack-bolt",
+    "python-dotenv",
+    "websocket-client",
+    "tzdata",
 ]
 
 [project.optional-dependencies]

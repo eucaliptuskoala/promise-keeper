@@ -1,64 +1,122 @@
-"""Promise Keeper application entry point."""
+"""Application wiring for model interpretation, SQLite and Slack delivery."""
 
+import argparse
 import logging
 import signal
-import sys
+from contextlib import closing
+from datetime import datetime, timezone
+
 from dotenv import load_dotenv
+from openai import OpenAI
+from pydantic import ValidationError
 
-from promise_keeper.adapters.slack import SlackAdapter
+from promise_keeper.agent import interpret_message
 from promise_keeper.config import load_settings
+from promise_keeper.models import ActionResult, AgentDecision, NormalizedEvent, PipelineResult, PromiseRecord, UserAction
+from promise_keeper.pipeline import handle_user_action, process_event
+from promise_keeper.reminders import check_reminders
+from promise_keeper.storage import bind_card, get_promise, initialize_storage, pending_responses, record_delivery
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 logger = logging.getLogger("promise_keeper")
 
 
-def main() -> None:
-    """Start the Promise Keeper application with the Slack Socket Mode adapter."""
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Track commitments in Slack or run an isolated simulation")
+    parser.add_argument("--simulation", action="store_true", help="Run the offline core demo without Slack or keys")
+    parser.add_argument(
+        "--live-model", action="store_true", help="Use the configured model for synthetic simulation messages",
+    )
+    arguments = parser.parse_args(argv)
+    if arguments.live_model and not arguments.simulation:
+        parser.error("--live-model requires --simulation")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    if arguments.simulation:
+        from promise_keeper.adapters.simulation import run_simulation
+
+        run_simulation(live_model=arguments.live_model)
+        return
+
     load_dotenv()
     try:
         settings = load_settings()
-    except Exception:
-        # Fall back to Slack transport mode if model API key is not yet configured
-        try:
-            settings = load_settings(require_model=False)
-            logger.warning(
-                "OPENAI_API_KEY not configured. Running in Slack transport mode. "
-                "Set OPENAI_API_KEY in .env when model access is available."
-            )
-        except Exception as exc:
-            logger.error("Failed to load settings: %s", exc)
-            sys.exit(1)
+    except (ValidationError, ValueError):
+        logger.error("Invalid configuration. Check required keys, MODEL_TIMEOUT_SECONDS and APP_TIMEZONE.")
+        raise SystemExit(1) from None
+    if not settings.slack_bot_token or not settings.slack_app_token or not settings.enabled_channels:
+        logger.error("SLACK_BOT_TOKEN, SLACK_APP_TOKEN and SLACK_ENABLED_CHANNELS are required.")
+        raise SystemExit(1)
 
-    if not settings.slack_bot_token or not settings.slack_app_token:
-        logger.error(
-            "Missing Slack configuration. Ensure SLACK_BOT_TOKEN (or BOT_OAUTH_TOKEN) "
-            "and SLACK_APP_TOKEN (or BOT_APP_TOKEN) are set in .env"
+    from promise_keeper.adapters.slack import SlackAdapter
+
+    initialize_storage(settings.database_path).close()
+    with OpenAI(
+        api_key=settings.openai_api_key,
+        base_url=settings.openai_base_url,
+        timeout=settings.model_timeout_seconds,
+        max_retries=0,
+    ) as client:
+        def interpret(event: NormalizedEvent, promises: list[PromiseRecord]) -> AgentDecision:
+            return interpret_message(event, promises, client, settings.openai_model, settings.default_timezone)
+
+        def process(event: NormalizedEvent) -> PipelineResult:
+            with closing(initialize_storage(settings.database_path)) as database:
+                return process_event(event, database, interpret)
+
+        def handle_action(action: UserAction) -> ActionResult:
+            with closing(initialize_storage(settings.database_path)) as database:
+                promise = get_promise(database, action.promise_id)
+                if promise is None or promise.channel_id not in settings.enabled_channels:
+                    return ActionResult(success=False, error_message="Promise not found in an enabled channel.")
+                return handle_user_action(action, database)
+
+        def acknowledge_delivery(event_id: str, kind: str, message_ts: str | None) -> None:
+            with closing(initialize_storage(settings.database_path)) as database:
+                record_delivery(database, adapter.workspace_id, event_id, kind, message_ts, datetime.now(timezone.utc))
+
+        def acknowledge_reminder(promise_id: str, channel_id: str, message_ts: str) -> None:
+            with closing(initialize_storage(settings.database_path)) as database:
+                with database:
+                    bind_card(database, adapter.workspace_id, channel_id, message_ts, promise_id)
+
+        def tick() -> None:
+            now = datetime.now(timezone.utc)
+            with closing(initialize_storage(settings.database_path)) as database:
+                for row in pending_responses(database, adapter.workspace_id, now):
+                    if row["kind"] == "message":
+                        result = PipelineResult.model_validate_json(row["result_json"])
+                        card = result.promise_card
+                    else:
+                        result = ActionResult.model_validate_json(row["result_json"])
+                        card = result.updated_card
+                    if card:
+                        promise = get_promise(database, card.promise_id)
+                        if promise is None or promise.channel_id not in settings.enabled_channels:
+                            continue
+                        updates = {"promise_card" if row["kind"] == "message" else "updated_card": promise.card()}
+                        result = type(result).model_validate({**result.model_dump(), **updates})
+                    elif row["channel_id"] not in settings.enabled_channels:
+                        continue
+                    message_ts = adapter.deliver_result(row["channel_id"], row["target_ts"], row["kind"], result)
+                    record_delivery(
+                        database, adapter.workspace_id, row["event_id"], row["kind"], message_ts, now,
+                    )
+                check_reminders(database, adapter.send_owner_reminder, now, adapter.workspace_id, settings.enabled_channels)
+
+        adapter = SlackAdapter(
+            bot_token=settings.slack_bot_token, app_token=settings.slack_app_token,
+            process_event_fn=process, handle_action_fn=handle_action, enabled_channels=settings.enabled_channels,
+            record_delivery_fn=acknowledge_delivery, record_reminder_fn=acknowledge_reminder, tick_fn=tick,
         )
-        sys.exit(1)
 
-    logger.info("Initializing Promise Keeper with model %s", settings.openai_model)
-    adapter = SlackAdapter(
-        bot_token=settings.slack_bot_token,
-        app_token=settings.slack_app_token,
-    )
+        def shutdown(signum, frame) -> None:
+            adapter.stop()
 
-    def shutdown(signum, frame):
-        logger.info("Received signal %s. Shutting down gracefully...", signum)
-        adapter.stop()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
-
-    logger.info("Starting Socket Mode adapter. Listening for Slack events...")
-    try:
-        adapter.start()
-    except KeyboardInterrupt:
-        shutdown(signal.SIGINT, None)
+        previous_handlers = {name: signal.signal(name, shutdown) for name in (signal.SIGINT, signal.SIGTERM)}
+        try:
+            adapter.start()
+        finally:
+            for name, handler in previous_handlers.items():
+                signal.signal(name, handler)
 
 
 if __name__ == "__main__":

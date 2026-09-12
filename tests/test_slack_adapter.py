@@ -1,330 +1,189 @@
-"""Unit tests for the Slack transport adapter and Block Kit builders."""
-
 from unittest.mock import MagicMock, patch
+
 import pytest
+from slack_sdk.errors import SlackApiError
 
-from promise_keeper.adapters.slack import (
-    SlackAdapter,
-    build_promise_card,
-    build_reminder_card,
-)
-from promise_keeper.models import (
-    ActionResult,
-    ContextMessage,
-    NormalizedEvent,
-    PipelineResult,
-    PromiseCardData,
-    ReminderNotification,
-    UserAction,
-)
+from promise_keeper.adapters.slack import SlackAdapter, build_promise_card
+from promise_keeper.models import ActionResult, PipelineResult, PromiseCardData, ReminderNotification
 
 
-def test_build_promise_card_pending_confirmation() -> None:
-    card = PromiseCardData(
-        promise_id="p-123",
-        owner_id="U12345",
-        action="send the designs",
-        deadline_text="by noon",
-        status="pending_confirmation",
-    )
-    blocks = build_promise_card(card)
-
-    assert len(blocks) == 2
-    assert blocks[0]["type"] == "section"
-    assert "<@U12345>" in blocks[0]["text"]["text"]
-    assert "send the designs" in blocks[0]["text"]["text"]
-    assert "by noon" in blocks[0]["text"]["text"]
-    assert "Pending Confirmation" in blocks[0]["text"]["text"]
-
-    actions = blocks[1]["elements"]
-    assert len(actions) == 2
-    assert actions[0]["action_id"] == "promise_confirm"
-    assert actions[0]["value"] == "p-123"
-    assert actions[1]["action_id"] == "promise_dismiss"
-    assert actions[1]["value"] == "p-123"
-
-
-def test_build_promise_card_confirmed() -> None:
-    card = PromiseCardData(
-        promise_id="p-123",
-        owner_id="U12345",
-        action="build the API",
-        status="confirmed",
-    )
-    blocks = build_promise_card(card)
-
-    assert len(blocks) == 2
-    assert "Confirmed" in blocks[0]["text"]["text"]
-    actions = blocks[1]["elements"]
-    assert len(actions) == 2
-    assert actions[0]["action_id"] == "promise_complete"
-    assert actions[1]["action_id"] == "promise_snooze"
-
-
-def test_build_promise_card_completed_has_no_actions() -> None:
-    card = PromiseCardData(
-        promise_id="p-123",
-        owner_id="U12345",
-        action="build the API",
-        status="completed",
-    )
-    blocks = build_promise_card(card)
-
-    # Completed cards should only have the info section, no buttons
-    assert len(blocks) == 1
-    assert "Completed" in blocks[0]["text"]["text"]
-
-
-def test_build_reminder_card() -> None:
-    notification = ReminderNotification(
-        promise_id="p-456",
-        owner_id="U99999",
-        action="review pull request",
-        deadline_text="today 5pm",
-    )
-    blocks = build_reminder_card(notification)
-
-    assert len(blocks) == 2
-    assert "review pull request" in blocks[0]["text"]["text"]
-    assert "today 5pm" in blocks[0]["text"]["text"]
-    assert blocks[1]["elements"][0]["action_id"] == "promise_complete"
-
-
-@patch("promise_keeper.adapters.slack.SocketModeHandler")
-@patch("promise_keeper.adapters.slack.App")
-def test_slack_adapter_ignores_bot_messages(mock_app_cls: MagicMock, mock_handler_cls: MagicMock) -> None:
-    mock_app = MagicMock()
-    mock_app.client.auth_test.return_value = {"user_id": "UBOT123", "team_id": "T123", "team": "Demo"}
-    mock_app_cls.return_value = mock_app
-
-    mock_process = MagicMock()
-    adapter = SlackAdapter(
-        bot_token="xoxb-dummy",
-        app_token="xapp-dummy",
-        process_event_fn=mock_process,
-    )
-
-    # Case 1: bot_id is present
-    adapter._handle_inbound_message({"bot_id": "B123", "text": "I am a bot"})
-    mock_process.assert_not_called()
-
-    # Case 2: author is the bot itself
-    adapter._handle_inbound_message({"user": "UBOT123", "text": "Echo message"})
-    mock_process.assert_not_called()
-
-    # Case 3: unwanted subtype
-    adapter._handle_inbound_message({"user": "UUSER1", "subtype": "channel_join", "text": "joined"})
-    mock_process.assert_not_called()
-
-
-@patch("promise_keeper.adapters.slack.SocketModeHandler")
-@patch("promise_keeper.adapters.slack.App")
-def test_slack_adapter_normalizes_and_dispatches_message(mock_app_cls: MagicMock, mock_handler_cls: MagicMock) -> None:
-    mock_app = MagicMock()
-    mock_app.client.auth_test.return_value = {"user_id": "UBOT123", "team_id": "T123", "team": "Demo"}
-    mock_app_cls.return_value = mock_app
-
-    captured_event = None
-
-    def fake_process(event: NormalizedEvent) -> PipelineResult:
-        nonlocal captured_event
-        captured_event = event
-        return PipelineResult(
-            processed=True,
-            should_respond=True,
-            promise_card=PromiseCardData(
-                promise_id="p-1",
-                owner_id=event.author_id,
-                action="deliver slides",
-                status="pending_confirmation",
-            ),
+@pytest.fixture
+def adapter():
+    with patch("promise_keeper.adapters.slack.App") as app_class, patch("promise_keeper.adapters.slack.SocketModeHandler"):
+        app = MagicMock()
+        app.client.auth_test.return_value = {"user_id": "bot", "team_id": "T1"}
+        app.client.conversations_history.return_value = {"messages": []}
+        app.client.chat_postMessage.return_value = {"ts": "1789207201.000001"}
+        app.client.chat_update.return_value = {"ts": "1789207201.000001"}
+        app_class.return_value = app
+        instance = SlackAdapter(
+            bot_token="synthetic-bot-token", app_token="synthetic-app-token",
+            process_event_fn=MagicMock(return_value=PipelineResult(status="ignored")),
+            handle_action_fn=MagicMock(), enabled_channels=("C1",),
+            record_delivery_fn=MagicMock(), record_reminder_fn=MagicMock(),
         )
-
-    adapter = SlackAdapter(
-        bot_token="xoxb-dummy",
-        app_token="xapp-dummy",
-        process_event_fn=fake_process,
-    )
-
-    raw_event = {
-        "channel": "C12345",
-        "user": "UALICE",
-        "text": "I will deliver slides by tomorrow",
-        "ts": "1710000000.000100",
-    }
-    adapter._handle_inbound_message(raw_event)
-
-    assert captured_event is not None
-    assert captured_event.channel_id == "C12345"
-    assert captured_event.author_id == "UALICE"
-    assert captured_event.text == "I will deliver slides by tomorrow"
-    assert captured_event.event_ts == "1710000000.000100"
-    assert captured_event.workspace_id == "T123"
-
-    # Verify message was posted with Block Kit card
-    mock_app.client.chat_postMessage.assert_called_once()
-    call_kwargs = mock_app.client.chat_postMessage.call_args.kwargs
-    assert call_kwargs["channel"] == "C12345"
-    assert call_kwargs["thread_ts"] == "1710000000.000100"
-    assert len(call_kwargs["blocks"]) == 2
+        yield instance
 
 
-@patch("promise_keeper.adapters.slack.SocketModeHandler")
-@patch("promise_keeper.adapters.slack.App")
-def test_slack_adapter_fetches_thread_context(mock_app_cls: MagicMock, mock_handler_cls: MagicMock) -> None:
-    mock_app = MagicMock()
-    mock_app.client.auth_test.return_value = {"user_id": "UBOT123", "team_id": "T123", "team": "Demo"}
-    mock_app.client.conversations_replies.return_value = {
-        "messages": [
-            {"user": "UBOB", "text": "Can someone do this?", "ts": "1710000000.000010"},
-            {"user": "UALICE", "text": "I will take it", "ts": "1710000000.000020"},
-        ]
-    }
-    mock_app_cls.return_value = mock_app
-
-    captured_event = None
-
-    def fake_process(event: NormalizedEvent) -> PipelineResult:
-        nonlocal captured_event
-        captured_event = event
-        return PipelineResult(processed=True, should_respond=False)
-
-    adapter = SlackAdapter(
-        bot_token="xoxb-dummy",
-        app_token="xapp-dummy",
-        process_event_fn=fake_process,
-    )
-
-    raw_event = {
-        "channel": "C12345",
-        "user": "UALICE",
-        "text": "I will take it",
-        "ts": "1710000000.000020",
-        "thread_ts": "1710000000.000010",
-    }
-    adapter._handle_inbound_message(raw_event)
-
-    assert captured_event is not None
-    assert captured_event.thread_ts == "1710000000.000010"
-    # Should include Bob's message but exclude Alice's current message
-    assert len(captured_event.context_messages) == 1
-    assert captured_event.context_messages[0].user_id == "UBOB"
-    assert captured_event.context_messages[0].text == "Can someone do this?"
+@pytest.fixture
+def card() -> PromiseCardData:
+    return PromiseCardData(promise_id="p-1", owner_id="alice", action="Send designs", deadline_text="by noon")
 
 
-@patch("promise_keeper.adapters.slack.SocketModeHandler")
-@patch("promise_keeper.adapters.slack.App")
-def test_slack_adapter_handles_interactive_action_authorized(mock_app_cls: MagicMock, mock_handler_cls: MagicMock) -> None:
-    mock_app = MagicMock()
-    mock_app.client.auth_test.return_value = {"user_id": "UBOT123", "team_id": "T123", "team": "Demo"}
-    mock_app_cls.return_value = mock_app
+@pytest.fixture
+def body() -> dict:
+    return {"team": {"id": "T1"}, "user": {"id": "alice"}, "channel": {"id": "C1"},
+            "message": {"ts": "1789207201.000001"},
+            "actions": [{"action_id": "promise_confirm", "value": "p-1", "action_ts": "1789207260.000001"}]}
 
-    def fake_action_handler(action: UserAction) -> ActionResult:
-        assert action.action_name == "confirm"
-        assert action.promise_id == "p-999"
-        assert action.actor_id == "UALICE"
-        return ActionResult(
-            success=True,
-            updated_card=PromiseCardData(
-                promise_id="p-999",
-                owner_id="UALICE",
-                action="deliver slides",
-                status="confirmed",
-            ),
-        )
 
-    adapter = SlackAdapter(
-        bot_token="xoxb-dummy",
-        app_token="xapp-dummy",
-        handle_action_fn=fake_action_handler,
-    )
+def test_card_buttons_match_lifecycle(card) -> None:
+    pending = build_promise_card(card)
+    assert [button["action_id"] for button in pending[1]["elements"]] == ["promise_confirm", "promise_dismiss"]
+    confirmed = build_promise_card(card.model_copy(update={"status": "confirmed"}))
+    assert [button["action_id"] for button in confirmed[1]["elements"]] == ["promise_complete", "promise_reschedule", "promise_snooze"]
+    assert len(build_promise_card(card.model_copy(update={"status": "completed"}))) == 1
+    assert len(build_promise_card(card.model_copy(update={"status": "dismissed"}))) == 1
 
-    body = {
-        "user": {"id": "UALICE"},
-        "channel": {"id": "C12345"},
-        "message": {"ts": "1710000000.000099"},
-        "actions": [
-            {
-                "action_id": "promise_confirm",
-                "value": "p-999",
-            }
-        ],
-    }
 
+def test_untrusted_card_text_cannot_inject_mentions(card) -> None:
+    hostile = card.model_copy(update={"action": "Send <!channel> <@bob> & designs"})
+    text = build_promise_card(hostile)[0]["text"]["text"]
+    assert "<!channel>" not in text
+    assert "<@bob>" not in text
+    assert "<@alice>" in text
+    assert "&amp;" in text
+
+
+def test_cards_stay_within_section_text_limit(card) -> None:
+    oversized = card.model_copy(update={"action": "&" * 2000, "deadline_text": "&" * 1000})
+    assert len(build_promise_card(oversized)[0]["text"]["text"]) <= 3000
+
+
+@pytest.mark.parametrize("event", [
+    {"bot_id": "B1", "user": "alice", "text": "I'll send it", "channel": "C1"},
+    {"user": "bot", "text": "I'll send it", "channel": "C1"},
+    {"user": "alice", "text": "joined", "subtype": "channel_join", "channel": "C1"},
+    {"user": "alice", "text": "I'll send it", "channel": "C2"},
+    {"user": "alice", "text": " ", "channel": "C1"},
+])
+def test_adapter_ignores_unsupported_or_disabled_messages(adapter, event) -> None:
+    adapter._handle_inbound_message(event)
+    adapter.process_event_fn.assert_not_called()
+
+
+def test_normalization_and_delivery_are_acknowledged(adapter, card) -> None:
+    adapter.process_event_fn.return_value = PipelineResult(promise_card=card)
+    adapter._handle_inbound_message({"channel": "C1", "user": "alice", "text": "I'll send designs", "ts": "1789207200.000001"}, "Ev1")
+    event = adapter.process_event_fn.call_args.args[0]
+    assert event.event_id == "Ev1"
+    assert event.workspace_id == "T1"
+    assert event.author_id == "alice"
+    adapter.app.client.chat_postMessage.assert_called_once()
+    assert adapter.app.client.chat_postMessage.call_args.kwargs["thread_ts"] == event.event_ts
+    adapter.record_delivery_fn.assert_called_once_with("Ev1", "message", "1789207201.000001")
+
+
+def test_failed_delivery_is_not_reported_as_sent(adapter, card) -> None:
+    adapter.process_event_fn.return_value = PipelineResult(promise_card=card)
+    adapter.app.client.chat_postMessage.side_effect = SlackApiError("synthetic", {"error": "ratelimited"})
+    adapter._handle_inbound_message({"channel": "C1", "user": "alice", "text": "I'll send designs", "ts": "1789207200.000001"}, "Ev1")
+    adapter.record_delivery_fn.assert_called_once_with("Ev1", "message", None)
+
+
+def test_context_excludes_future_bot_and_current_messages(adapter) -> None:
+    adapter.app.client.conversations_replies.return_value = {"messages": [
+        {"user": "bob", "text": "Can you send designs?", "ts": "1789207200.000001"},
+        {"user": "alice", "text": "Yes", "ts": "1789207202.000001"},
+        {"user": "bob", "text": "Future reply", "ts": "1789207203.000001"},
+        {"user": "bot", "text": "Card", "ts": "1789207201.000001"},
+    ]}
+    adapter._handle_inbound_message({"channel": "C1", "user": "alice", "text": "Yes", "ts": "1789207202.000001", "thread_ts": "1789207200.000001"})
+    context = adapter.process_event_fn.call_args.args[0].context_messages
+    assert len(context) == 1
+    assert context[0].user_id == "bob"
+
+
+def test_bot_thread_permission_failure_fetches_parent(adapter) -> None:
+    adapter.app.client.conversations_replies.side_effect = SlackApiError("synthetic", {"error": "missing_scope"})
+    adapter.app.client.conversations_history.return_value = {"messages": [
+        {"user": "bob", "text": "Send designs?", "ts": "1789207200.000001"},
+    ]}
+    context = adapter._fetch_thread_context("C1", "1789207200.000001", "1789207202.000001")
+    assert context[0].text == "Send designs?"
+    assert adapter.app.client.conversations_history.call_args.kwargs["oldest"] == "1789207200.000001"
+
+
+def test_action_uses_trusted_actor_and_stable_click_id(adapter, body, card) -> None:
+    adapter.handle_action_fn.return_value = ActionResult(success=True, updated_card=card.model_copy(update={"status": "confirmed"}))
     adapter._handle_interactive_action(body)
+    action = adapter.handle_action_fn.call_args.args[0]
+    assert action.actor_id == "alice"
+    assert action.workspace_id == "T1"
+    assert action.event_id.endswith("promise_confirm:1789207260.000001")
+    adapter.app.client.chat_update.assert_called_once()
+    adapter.record_delivery_fn.assert_called_once_with(action.event_id, "action", "1789207201.000001")
 
-    mock_app.client.chat_update.assert_called_once()
-    call_kwargs = mock_app.client.chat_update.call_args.kwargs
-    assert call_kwargs["channel"] == "C12345"
-    assert call_kwargs["ts"] == "1710000000.000099"
-    assert "Confirmed" in call_kwargs["blocks"][0]["text"]["text"]
 
-
-@patch("promise_keeper.adapters.slack.SocketModeHandler")
-@patch("promise_keeper.adapters.slack.App")
-def test_slack_adapter_handles_interactive_action_unauthorized(mock_app_cls: MagicMock, mock_handler_cls: MagicMock) -> None:
-    mock_app = MagicMock()
-    mock_app.client.auth_test.return_value = {"user_id": "UBOT123", "team_id": "T123", "team": "Demo"}
-    mock_app_cls.return_value = mock_app
-
-    def fake_action_handler(action: UserAction) -> ActionResult:
-        return ActionResult(
-            success=False,
-            error_message="Only the promise owner can confirm this promise.",
-        )
-
-    adapter = SlackAdapter(
-        bot_token="xoxb-dummy",
-        app_token="xapp-dummy",
-        handle_action_fn=fake_action_handler,
-    )
-
-    body = {
-        "user": {"id": "UEVE"},
-        "channel": {"id": "C12345"},
-        "message": {"ts": "1710000000.000099"},
-        "actions": [
-            {
-                "action_id": "promise_confirm",
-                "value": "p-999",
-            }
-        ],
-    }
-
+def test_unauthorized_action_does_not_update_card(adapter, body) -> None:
+    adapter.handle_action_fn.return_value = ActionResult(success=False, error_message="Only the promise owner can perform this action.")
     adapter._handle_interactive_action(body)
-
-    mock_app.client.chat_update.assert_not_called()
-    mock_app.client.chat_postEphemeral.assert_called_once()
-    ephemeral_kwargs = mock_app.client.chat_postEphemeral.call_args.kwargs
-    assert ephemeral_kwargs["channel"] == "C12345"
-    assert ephemeral_kwargs["user"] == "UEVE"
-    assert "Only the promise owner" in ephemeral_kwargs["text"]
+    adapter.app.client.chat_update.assert_not_called()
+    adapter.app.client.chat_postEphemeral.assert_called_once()
 
 
-@patch("promise_keeper.adapters.slack.SocketModeHandler")
-@patch("promise_keeper.adapters.slack.App")
-def test_slack_adapter_send_owner_reminder(mock_app_cls: MagicMock, mock_handler_cls: MagicMock) -> None:
-    mock_app = MagicMock()
-    mock_app.client.auth_test.return_value = {"user_id": "UBOT123", "team_id": "T123", "team": "Demo"}
-    mock_app.client.conversations_open.return_value = {"channel": {"id": "D_ALICE"}}
-    mock_app_cls.return_value = mock_app
+def test_foreign_workspace_action_is_ignored(adapter, body) -> None:
+    body["team"]["id"] = "T2"
+    adapter._handle_interactive_action(body)
+    adapter.handle_action_fn.assert_not_called()
 
-    adapter = SlackAdapter(
-        bot_token="xoxb-dummy",
-        app_token="xapp-dummy",
-    )
 
-    notification = ReminderNotification(
-        promise_id="p-111",
-        owner_id="UALICE",
-        action="finish slides",
-        deadline_text="12:00",
-    )
+def test_reschedule_opens_modal_without_changing_state(adapter, body) -> None:
+    body["trigger_id"] = "synthetic-trigger"
+    body["actions"][0]["action_id"] = "promise_reschedule"
+    adapter._handle_interactive_action(body)
+    adapter.app.client.views_open.assert_called_once()
+    adapter.handle_action_fn.assert_not_called()
+    assert adapter.app.client.views_open.call_args.kwargs["view"]["blocks"][0]["element"]["type"] == "datetimepicker"
 
-    success = adapter.send_owner_reminder(notification)
-    assert success is True
-    mock_app.client.conversations_open.assert_called_once_with(users=["UALICE"])
-    mock_app.client.chat_postMessage.assert_called_once()
-    call_kwargs = mock_app.client.chat_postMessage.call_args.kwargs
-    assert call_kwargs["channel"] == "D_ALICE"
-    assert len(call_kwargs["blocks"]) == 2
+
+def test_reschedule_submission_passes_typed_deadline(adapter, card) -> None:
+    adapter.handle_action_fn.return_value = ActionResult(success=True, updated_card=card.model_copy(update={"status": "confirmed"}))
+    body = {"team": {"id": "T1"}, "user": {"id": "alice"}, "view": {
+        "id": "view-1", "hash": "hash-1", "private_metadata": '{"promise_id":"p-1","channel_id":"C1","message_ts":"1789207201.000001","occurred_at":"2026-09-12T10:01:00Z"}',
+        "state": {"values": {"deadline": {"deadline_at": {"selected_date_time": 1789293600}}}},
+    }}
+    adapter._handle_reschedule_submission(body)
+    action = adapter.handle_action_fn.call_args.args[0]
+    assert action.action_name == "reschedule"
+    assert action.deadline_at.timestamp() == 1789293600
+
+
+def test_private_delivery_records_card_and_never_falls_back_publicly(adapter) -> None:
+    notification = ReminderNotification(promise_id="p-1", workspace_id="T1", owner_id="alice", action="Send designs", channel_id="C1", thread_ts="1789207200.000001")
+    adapter.app.client.conversations_open.return_value = {"channel": {"id": "D1"}}
+    assert adapter.send_owner_reminder(notification)
+    assert adapter.app.client.chat_postMessage.call_args.kwargs["channel"] == "D1"
+    adapter.record_reminder_fn.assert_called_once_with("p-1", "D1", "1789207201.000001")
+    adapter.app.client.chat_postMessage.reset_mock()
+    adapter.app.client.conversations_open.side_effect = SlackApiError("synthetic", {"error": "missing_scope"})
+    assert not adapter.send_owner_reminder(notification)
+    adapter.app.client.chat_postMessage.assert_not_called()
+
+
+def test_stop_is_idempotent(adapter) -> None:
+    adapter.stop()
+    adapter.stop()
+    adapter.handler.close.assert_called_once()
+
+
+def test_start_uses_connect_and_can_stop_on_windows(adapter) -> None:
+    from threading import Thread
+
+    running = Thread(target=adapter.start, daemon=True)
+    running.start()
+    adapter.stop()
+    running.join(timeout=2)
+    assert not running.is_alive()
+    adapter.handler.connect.assert_called_once()
+    adapter.handler.start.assert_not_called()

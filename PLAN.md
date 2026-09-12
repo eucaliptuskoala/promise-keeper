@@ -1,189 +1,49 @@
-# Promise Keeper MVP implementation plan
+# Promise Keeper implementation
 
-## Goal and scope
+## Current scope and verification
 
-Build a Python-first agent that takes a Slack or synthetic message through one shared pipeline, creates a pending promise for the message author, lets that owner confirm or dismiss it, preserves the confirmed promise across restarts, closes it on completion, and sends one reminder when it becomes overdue.
+One Python application integrates the shared core, SQLite and a thin Slack Bolt adapter. No additional service, transport bridge, vector database or agent framework is used. The main promise lifecycle and reminder policy are implemented and tested offline. Live model interpretation and real Slack delivery are not established by these tests; no model API key was available for an authenticated feasibility probe. Dependency tracking remains deferred until the required live workflow works.
 
-A single explicit dependency between promises, blocker propagation, and a completion handoff are stretch work after this end-to-end lifecycle is verified.
+## Boundary contract
 
-The first target is one workspace and explicitly enabled public channels. Slack is the demo platform; Teams is not an initial deliverable. The agent tracks promised work but does not perform it.
+`NormalizedEvent` preserves the existing adapter names: `event_id`, `workspace_id`, `channel_id`, `author_id`, `text`, `event_ts`, optional `thread_ts`, aware `received_at`, and chronological `context_messages`. Original Slack timestamp strings are preserved; `occurred_at` is derived for reasoning and chronological comparisons. Identity comes from trusted transport metadata. Context has at most 20 human messages, 8000 characters per message, 16000 characters total, and excludes the current message and later messages.
 
-Build the new application from scratch. Do not import the previous research prototype's source, tests, or prompts. This document is a plan, not evidence that any integration or feature already works.
+`process_event(event, database, interpret) -> PipelineResult` accepts an explicit SQLite connection and an interpretation callable. `PipelineResult.status` distinguishes processed, ignored, duplicate and failed events. `processed` and `should_respond` are derived properties; callers cannot supply contradictory response flags. Exactly one optional card or clarification is returned. A processing result describes application state, never successful Slack delivery.
 
-## Architecture
+`UserAction` carries the acting user and workspace, a stable event ID, destination channel/card timestamp, original occurrence and receipt times, an enumerated action, and a promise ID. Supported actions are confirm, dismiss, complete, reschedule and snooze. Reschedule requires an aware deadline. Snooze may provide an aware future reminder time; otherwise application code chooses one hour after receipt, without changing the deadline.
 
-Use one Python application for direct Slack connectivity, promise interpretation, tools, storage, authorization, lifecycle rules, reminder decisions, and simulation. Use Slack Bolt with Socket Mode, Pydantic for boundary validation, SQLite for local persistence, and pytest for offline tests.
+For Block Kit, `promise_confirm`, `promise_dismiss`, `promise_complete`, `promise_snooze` and `promise_reschedule` are action IDs; the button value is only the promise ID. Workspace and actor come from Slack metadata. Normal button event IDs include channel, card timestamp, action ID and original `action_ts`; retries of the same click preserve identity. Deadline modals carry the original button occurrence time, use a stable view ID/hash receipt key, and convert the selected UNIX time into an aware deadline. Both owner and delivered-card binding are checked in the core before an interactive write. Arbitrary metadata or unknown promise IDs never create placeholder records.
 
-No messaging middleware, Node.js runtime, or agent-to-runtime HTTP bridge is needed. Use native Slack Block Kit for promise cards and interactive controls. Keep the Slack adapter thin and all promise rules in the shared Python core.
+`PromiseCardData` remains presentation data. `PromiseRecord` adds trusted scope/source, chronology and reminder state. Cards contain no Slack Block Kit implementation details; the adapter renders them and escapes untrusted action/deadline text. Text is bounded after escaping to fit a section.
 
-```text
-Slack ↔ Python Slack Bolt adapter (Socket Mode / Web API)
-                         ↕
-             normalize → shared pipeline ← synthetic events
-                         ↕
-                   agent + tools ↔ model API
-                         ↕
-                       SQLite
+## Reasoning and deterministic execution
 
-Python reminder check → Slack Web API / captured test output
-```
+`agent.interpret_message` makes one bounded Chat Completions JSON-mode request through the configured OpenAI SDK client. The application sets a finite timeout and disables SDK retries. Native tool calling is not assumed; the selected gateway's authenticated generation, JSON mode and context limits still need a live check. This is the planned validated-JSON protocol, not a silent regex substitute.
 
-Socket Mode receives Slack events and interactive payloads without a public HTTP endpoint. Outbound messages use the Slack Web API. Both paths belong to the same Python application; the reminder check is an in-process job, not another service.
+`AgentDecision` allows ignore, clarify, create, complete and reschedule. It cannot choose an owner, workspace, recipient or SQL. Writes require an exact non-blank evidence substring from the current author's message. Parsed deadlines require original wording present in current text or supplied conversation context. An unstated deadline stays null; ambiguous stated deadlines may remain unparsed and cannot generate reminders. Relative dates are interpreted using the original message time and configured timezone. These deterministic checks constrain writes but do not prove model understanding or eliminate every possible semantic hallucination.
 
-The target reasoning model is `qwen3.8-27b` through the Aptget gateway at `https://api.aptget.nl/v1`. The `/v1/models` route and Bearer authentication requirement have been reached, but an authenticated completion, structured output, native tool calling, context limits, and timeout behavior remain unverified. Treat the current Python client choice and tool-call protocol as provisional until that live check succeeds.
+Open promises supplied to the model belong to the current actor, workspace and channel. The current thread is prioritized, with at most 20 records. A clear natural-language completion or deadline update goes through the same owner/state/chronology rules as buttons. Unclear matches ask for clarification. Prompt instructions explicitly exclude quotations, jokes, hypotheticals, mere ability, vague intentions and unaccepted requests; model quality needs a separate live evaluation.
 
-Keep the endpoint, credentials, and model configurable. Use finite timeouts, bounded retries, bounded context, and a bounded number of model steps regardless of the eventual request protocol. If native tool calling is unavailable, accept one Pydantic-validated JSON decision and execute its authorized action in application code.
+`tools.create_promise` and `tools.execute_tool` contain application writes and lifecycle rules. Creation is pending confirmation. Confirm and dismiss act on pending promises; complete, reschedule and snooze require confirmation. Completed and dismissed records cannot reopen through confirmation. Repeated same-state confirm/complete/dismiss actions are idempotent. Older updates cannot overwrite a newer agreement. Snooze applies only to an overdue promise with a known deadline, persists notification timing and leaves the agreement intact.
 
-Reference: [Slack Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/).
+## Persistence and delivery
 
-## Model endpoint feasibility check
+`storage.initialize_storage(path)` creates missing tables without replacing existing data and returns a connection that the caller closes. Records use ordinary SQLite tables: promises, chronological previous/current snapshots, processed events with outbound state, and delivered card bindings. SQLite JSON record snapshots are the authoritative domain state; workspace/channel/owner columns index immutable scope. No full channel archive is stored.
 
-Before implementing the model adapter, use a real Aptget API key to list models and perform one simple `qwen3.8-27b` completion. Then verify a structured JSON response, native tool behavior or its absence, the available context window, request timeout behavior, and error responses.
+Pipeline writes, history and event receipts commit in one transaction. A second receipt check under `BEGIN IMMEDIATE` prevents two workers from committing the same inbound event. Model failures leave no successful receipt and can be reprocessed. Transactions roll back partial tool failures. Message and action receipt keys are separate and workspace scoped.
 
-Do not infer successful generation from the reachable `/v1/models` route. Do not claim native tools or keep a client dependency solely because its protocol looks compatible. Record the authenticated probe separately from deterministic offline tests and live Slack checks.
+Returned responses are persisted as pending delivery in that same transaction. The Slack adapter acknowledges actual send/update success separately. The in-process periodic check retries pending effects without rerunning interpretation or creating promises, refreshes cards from current stored state, and stops after three delivery attempts. Disabled-channel effects are not delivered. Failure messages log safe codes or exception types rather than private text or credentials.
 
-## Slack integration and first feasibility check
+`reminders.check_reminders` uses an explicit aware clock and active workspace/channel scope. It excludes pending, closed, deadline-free, snoozed and already-reminded records. An attempt/backoff is persisted before sending; successful delivery is recorded afterward. One application lock serializes messages, controls and periodic checks through delivery. A private delivered reminder card is bound to its actual DM destination so its owner can complete or snooze it securely. No public delivery fallback is permitted.
 
-Create a Slack app in the test workspace, enable Socket Mode, and obtain a bot token with `channels:history`, `chat:write`, and `im:write`, plus an app-level token with `connections:write`. Keep them in local environment configuration as SLACK_BOT_TOKEN and SLACK_APP_TOKEN. Keep model credentials in the same local configuration, never in source control.
+The application uses per-callback SQLite connections and one in-process periodic thread, not a separate scheduler. Socket Mode uses `connect()` plus an application stop signal rather than the SDK's blocking `start()` method, preserving controlled shutdown on Windows. Multiple application processes sharing one database are not supported. External delivery followed by a process crash before acknowledgement can still duplicate a message; exactly-once delivery is not claimed.
 
-Install the app in the workspace and invite it to each enabled public channel. Subscribe to `message.channels` so ordinary human messages reach the adapter without mentioning the bot. Reinstall the app when changed scopes require it.
+## Slack context and live acceptance
 
-Enable interactivity and handle native Block Kit actions through Bolt. Acknowledge interactive actions promptly before slow model work. Keep message callbacks short and perform expensive processing outside the transport callback.
+Bot output, unsupported subtypes, empty messages and channels outside the allowlist are ignored before normalization. Thread context excludes current/future messages and bot output. A bounded in-memory conversation cache supports recent replies without storing a full conversation in SQLite. If `conversations.replies` rejects a bot token with a token/scope error, the adapter logs that full thread history is unavailable and fetches only the parent via channel history. Older arbitrary replies after restart are not guaranteed; adding a user token requires a separate access decision.
 
-The application can run locally while connected to the internet; no public tunnel or deployment is required for testing. It must remain running to receive events and send reminders. A valid token or socket connection does not prove end-to-end behavior.
+The live acceptance scenario is an ordinary human message without a mention, a persisted pending promise and card, an actual owner confirmation and completion click, denial of a non-owner click after restart, a deadline-modal change, and a privately delivered overdue reminder with working controls. Test each path on the real platform; token validity, a socket connection and mocked Web API calls do not establish it. Keep synthetic/live databases separate and preserve existing user data.
 
-First verify an ordinary, non-mentioned human message reaching the Python pipeline and a reply returning to the same Slack thread. Check source IDs, original timestamps, and access to the bounded thread/channel context. Do not require a mention to detect each promise.
+## References
 
-Next verify an actual owner button click, a delayed outbound message, and private owner delivery through the Web API. Keep the public-channel allowlist explicit, ignore bot output, and avoid subscribing to inbound DMs unless that scope is intentionally added.
-
-Document failed checks and missing permissions rather than silently replacing passive monitoring with a mention-only flow. Native cards, context retrieval, and reminder delivery require separate live checks.
-
-Reference: [public-channel message events](https://docs.slack.dev/reference/events/message.channels/).
-
-## Shared input and processing pipeline
-
-Normalize inbound events into stable workspace, channel, actor, message, thread, and event IDs, original event time, received time, text, and source reference. Obtain identity from trusted transport metadata.
-
-Ignore the application's own output, bot messages, unsupported subtypes, and already processed events. Keep edited/deleted-message reconciliation outside the first MVP and document that limitation.
-
-For a supported new message, collect bounded recent thread/channel context in chronological order and relevant stored promises. Supply the source timestamp and configured timezone so “tomorrow” is interpreted relative to the message, not the processing date.
-
-The agent interprets the input, may call scoped tools, and returns an acknowledgement or clarification only when useful. Application code validates writes and records resulting outbound effects. Ordinary discussion should not trigger a public bot response.
-
-Serialize processing within a conversation for the first version. Preserve source order where available and detect late events; do not blindly apply an older deadline change over a newer confirmed update.
-
-## Agent and tool flow
-
-```text
-message + context + relevant promises
-                  ↓
-            model reasoning
-                  ↓
-            typed tool call
-                  ↓
- scope / owner / state validation
-                  ↓
-        SQLite transaction
-                  ↓
-     actual tool result to model
-                  ↓
-       response or clarification
-```
-
-Start with this small tool surface:
-
-| Tool | Purpose |
-| --- | --- |
-| list_open_promises | Read relevant open promises in the trusted event scope. |
-| create_promise | Store a grounded commitment with its source evidence. |
-| complete_promise | Close a clearly matched promise under the owner policy. |
-| reschedule_promise | Change an existing promise's deadline with authorization. |
-
-The dependency stretch adds `link_dependency` only after the required lifecycle and reminder workflow passes.
-
-Create no obligation from an unaccepted request. Distinguish a firm commitment from a hope, hypothetical, quotation, joke, or vague intention. Use context for “yes, tomorrow,” but clarify when the promised action remains unclear.
-
-Keep unstated deadlines null and retain original deadline wording. Do not guess material timezone or date ambiguity.
-
-A message author can create a promise only for themself. Every detected promise is stored as pending and shown with confirm/dismiss controls. Only that owner can confirm, dismiss, complete, or reschedule it. Deadline nudges apply only after confirmation; another person's text cannot create or change the owner's promise.
-
-Explicit confirm, done, dismiss, snooze, and deadline-change actions are deterministic handlers. Verify the acting user against the promise owner; button payloads alone are not authorization. Snooze changes notification timing, not the agreed deadline.
-
-Use finite timeouts, bounded retries, and a maximum tool-loop length. Treat Slack content as untrusted data. The model must not choose arbitrary SQL, bypass scope checks, or route notifications to unrestricted recipients.
-
-## Storage and chronological memory
-
-Use ordinary SQLite records and transactions, not a vector database or full event-sourcing framework. Suggested minimal records:
-
-| Record | Contents |
-| --- | --- |
-| Promise | ID, workspace/channel/thread, owner, action, source message, original deadline text, parsed UTC deadline, confirmation/lifecycle state, timestamps. |
-| Promise history | Promise ID, action, actor, source reference, event and recorded times, relevant previous/new values. |
-| Dependency | Downstream/upstream promise IDs, evidence, proposed/confirmed state. |
-| Processed event | Stable event key and processing state for duplicate suppression and recoverable failures. |
-| Notification | Promise/dependency reference, notification type, authorized destination, unique logical key, delivery state and timestamps. |
-
-Keep blocked state separate from open/completed lifecycle status. A closed or dismissed promise stays available as evidence but is excluded from future reminders.
-
-Write state and corresponding history together. A deadline update preserves the previous agreement in history. Event deduplication prevents duplicate records and history entries; recoverable failures must not be marked permanently successful before processing finishes.
-
-Memory has two levels: bounded recent conversation context and persistent promise records/history. SQLite stores the normalized action, deadline, lifecycle and history, notification state, and Slack source identifiers, not full channel context. Important older promises are retrieved from storage even after their original messages leave the context window. Do not archive or resend the whole workspace.
-
-For example, creation on September 12, deadline change on September 13, and completion on September 14 belong to one promise, not three unrelated tasks. Retain both source time and recorded time to explain late delivery.
-
-Keep synthetic and real databases isolated. Retain the local MVP database until the workspace owner explicitly removes it; document its location once the storage path is implemented. Provide a manual demo-data reset that targets only the synthetic database. Do not delete a real database to reset a demo.
-
-## Reminders
-
-Run a simple periodic reminder check inside the Python application. A controlled clock supplies “now” during tests. Select confirmed, open promises whose deadlines have passed and whose notification policy allows a follow-up.
-
-For the first version, send one overdue nudge and allow an explicit snooze to schedule a later nudge. Exclude completed, dismissed, unconfirmed, and deadline-free promises. Recheck state before sending. Persist notification state across restarts.
-
-Prefer private owner reminders after verifying the delivery path. If private delivery fails, record a bounded retry; do not silently expose the promise in a public fallback.
-
-Store delivery intent and results so successful notifications are normally suppressed on retry. A crash between external delivery and saving the result can still cause a duplicate; do not claim exactly-once delivery. Reminder service is active only while the application runs.
-
-## Dependency stretch
-
-Keep dependency support small: one upstream promise per downstream promise in the same authorized channel scope. Require explicit evidence and downstream-owner confirmation. Reject self-links and cycles.
-
-An upstream delay flags the downstream work as blocked. Surface the upstream blocker rather than sending an independent generic nudge about the downstream task. Do not alter any downstream deadline automatically.
-
-Confirmed upstream completion clears the corresponding blocker and produces one handoff notification. If downstream deadlines no longer make sense, propose a change and wait for those owners' agreement.
-
-## Testing and simulation
-
-Synthetic Alice, Bob, and Andrii messages enter the same normalized Python pipeline, with distinct stable IDs and chronological timestamps. Advance the clock rather than sleeping. Capture outbound effects and never connect the simulator to a real Slack workspace.
-
-Offline tests use scripted model/tool responses. They verify state, tool execution, validation, history, and scheduling without keys. A separate opt-in live-model simulation evaluates language understanding. Transport integration tests verify Slack event normalization, Bolt action handling, and real platform behavior separately.
-
-Core scenarios cover a firm promise, vague intention, unaccepted request, missing deadline, relative deadline, contextual reply, completion, deadline update, dismissal, and snooze.
-
-Reliability checks cover duplicate events, unauthorized controls, late messages, restart persistence, invalid model output, tool failures, timeouts, injection attempts, and failed outbound delivery.
-
-After the required lifecycle and reminder flow passes, the dependency stretch demo covers a proposed/confirmed link, upstream delay, blocked downstream work, upstream completion, one handoff notification, and an unchanged downstream deadline. Test self-link and cycle rejection.
-
-Claim real Slack success only after a human message reaches Python and produces the intended Slack response. Verify controls with actual clicks and delayed notifications with an actual timer check. Keep mocked, live-model, and live-Slack results separate.
-
-## Hackathon implementation order
-
-Assume two people and a four-hour build window. Validate direct Slack connectivity alongside the offline core; prioritize a complete workflow over extra infrastructure.
-
-| Time | Python/core work | Integration/demo work | Checkpoint |
-| --- | --- | --- | --- |
-| 0:00–0:30 | Define normalized events, minimal persistence, and scripted model decisions. | Configure Slack scopes and prepare isolated synthetic input. | Offline event and storage path verified. |
-| 0:30–1:15 | Implement pending create, owner confirm/dismiss, completion, history, and restart tests. | Run the Alice/Andrii scripted simulation through the shared pipeline. | Required lifecycle works offline across restart. |
-| 1:15–1:45 | Probe Aptget completion, structured output, tool behavior, context, and timeout with a real key. | Record the supported protocol and connect only the verified model path. | Model feasibility result is explicit. |
-| 1:45–2:30 | Add one confirmed-promise reminder and duplicate suppression. | Prove Socket Mode receive/reply, then owner controls and private reminder delivery. | Required live workflow is verified or its blocker is recorded. |
-| 2:30–3:15 | Add the single explicit dependency only if the required checkpoint passed. | Test blocker and handoff behavior in the three-person scenario. | Stretch flow works without rewriting deadlines. |
-| 3:15–4:00 | Freeze features; fix blockers and run checks. | Update verified run instructions, rehearse, record demo, and prepare submission. | Reproducible demo and honest documentation. |
-
-If time slips, preserve the working promise lifecycle and reminders before expanding dependencies. Do not add other platforms or integrations. Mark omitted features as planned and distinguish passive monitoring from any temporary mention-triggered flow.
-
-## Documentation and data boundaries
-
-README remains a short project introduction with verified startup commands when available. This plan holds technical sequencing and decisions. AGENTS contains durable coding principles rather than the current backlog.
-
-Document the direct data path: Slack events reach our Python application, and selected reasoning context is sent to the model provider. Retain only necessary evidence and avoid full-conversation logs. Keep credentials, local databases, and real workspace fixtures out of Git.
-
-Before handing off, record important implementation choices, actual run commands, required permissions, successful checks, and unresolved limitations. Do not present this plan as implemented functionality.
+The request protocol follows the [OpenAI Chat Completions reference](https://developers.openai.com/api/reference/python/resources/chat/subresources/completions/methods/create). Slack-specific constraints are described in [conversations.replies](https://docs.slack.dev/reference/methods/conversations.replies/), [datetime picker](https://docs.slack.dev/reference/block-kit/block-elements/datetime-picker-element/), and [Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/). These references establish API behavior, not successful access in this workspace.

@@ -1,176 +1,121 @@
-"""Shared processing pipeline for real and synthetic events."""
+"""Shared event processing with explicit storage and model dependencies."""
 
 import logging
-import re
-import uuid
+import sqlite3
+from typing import Callable
+
+from openai import OpenAIError
+from pydantic import ValidationError
+
 from promise_keeper.models import (
     ActionResult,
+    AgentDecision,
     NormalizedEvent,
     PipelineResult,
-    PromiseCardData,
+    PromiseRecord,
     UserAction,
 )
+from promise_keeper.storage import (
+    get_processed_event,
+    get_promise,
+    list_open_promises,
+    record_processed_event,
+)
+from promise_keeper.tools import create_promise, execute_tool
 
 logger = logging.getLogger("promise_keeper.pipeline")
 
-# In-memory store for active promises (used for interactive action reconciliation)
-_PROMISES_CACHE: dict[str, PromiseCardData] = {}
 
-# Common commitment patterns for rule-based detection
-_COMMITMENT_PATTERNS = [
-    re.compile(r"\b(i will|i'll|i can|i promise to|i shall|i'm going to)\s+(.+)", re.IGNORECASE),
-    re.compile(r"\b(я сделаю|я отправлю|я напишу|я подготовлю|я закончу)\s+(.+)", re.IGNORECASE),
-]
+def process_event(
+    event: NormalizedEvent,
+    database: sqlite3.Connection,
+    interpret: Callable[[NormalizedEvent, list[PromiseRecord]], AgentDecision],
+) -> PipelineResult:
+    if get_processed_event(database, event.workspace_id, event.event_id, "message"):
+        return PipelineResult(status="duplicate")
+    promises = list_open_promises(
+        database, event.workspace_id, event.channel_id, event.author_id, event.thread_ts or event.event_ts,
+    )
+    try:
+        decision = AgentDecision.model_validate(interpret(event, promises))
+        if decision.operation in ("create", "complete", "reschedule"):
+            if not decision.evidence.strip() or decision.evidence not in event.text:
+                raise ValueError("Ungrounded evidence")
+        if decision.deadline_text is not None:
+            texts = [event.text, *(message.text for message in event.context_messages)]
+            if not any(decision.deadline_text in text for text in texts):
+                raise ValueError("Ungrounded deadline")
+        if decision.promise_id is not None and decision.promise_id not in {promise.promise_id for promise in promises}:
+            raise ValueError("Out-of-scope promise")
+    except (OpenAIError, ValidationError, ValueError, TimeoutError) as error:
+        logger.warning("Interpretation failed for event %s (%s)", event.event_id, type(error).__name__)
+        return PipelineResult(status="failed", error_code="interpretation_failed")
 
-_DEADLINE_PATTERNS = [
-    re.compile(r"\b(by\s+[^,.]+)", re.IGNORECASE),
-    re.compile(r"\b(before\s+[^,.]+)", re.IGNORECASE),
-    re.compile(r"\b(until\s+[^,.]+)", re.IGNORECASE),
-    re.compile(r"\b(tomorrow|today|tonight|next week|by noon|by 3 pm|by 5 pm)\b", re.IGNORECASE),
-    re.compile(r"\b(до\s+[^,.]+)", re.IGNORECASE),
-    re.compile(r"\b(завтра|сегодня)\b", re.IGNORECASE),
-]
-
-
-def _detect_commitment(text: str) -> tuple[str | None, str | None]:
-    """Extract action and deadline text from a message using heuristic matching.
-
-    Returns:
-        (action, deadline_text) if a commitment is detected, otherwise (None, None).
-    """
-    matched_action = None
-    for pattern in _COMMITMENT_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            matched_action = match.group(0).strip()
-            break
-
-    if not matched_action:
-        return None, None
-
-    # Check for stated deadline
-    deadline_text = None
-    for d_pattern in _DEADLINE_PATTERNS:
-        d_match = d_pattern.search(text)
-        if d_match:
-            deadline_text = d_match.group(0).strip()
-            break
-
-    return matched_action, deadline_text
-
-
-def process_event(event: NormalizedEvent) -> PipelineResult:
-    """Process one normalized inbound event.
-
-    Detects commitments from message text or conversation context and returns
-    outbound response actions. Can be backed by model reasoning or deterministic rules.
-    """
-    logger.info("Pipeline processing event: %s from author %s", event.event_id, event.author_id)
-
-    action_text, deadline_text = _detect_commitment(event.text)
-    if not action_text:
-        logger.debug("No firm commitment detected in message: %s", event.text)
-        return PipelineResult(
-            processed=True,
-            should_respond=False,
+    with database:
+        database.execute("BEGIN IMMEDIATE")
+        if get_processed_event(database, event.workspace_id, event.event_id, "message"):
+            return PipelineResult(status="duplicate")
+        if decision.operation == "ignore":
+            result = PipelineResult(status="ignored")
+        elif decision.operation == "clarify":
+            result = PipelineResult(thread_reply_text=decision.clarification)
+        elif decision.operation == "create":
+            result = PipelineResult(promise_card=create_promise(database, event, decision).card())
+        else:
+            action = UserAction(
+                action_name=decision.operation,
+                promise_id=decision.promise_id,
+                actor_id=event.author_id,
+                workspace_id=event.workspace_id,
+                event_id=event.event_id,
+                channel_id=event.channel_id,
+                message_ts=event.event_ts,
+                occurred_at=event.occurred_at,
+                received_at=event.received_at,
+                deadline_at=decision.deadline_at,
+                deadline_text=decision.deadline_text,
+            )
+            action_result = execute_tool(database, action)
+            if action_result.success:
+                result = PipelineResult(promise_card=action_result.updated_card)
+            else:
+                result = PipelineResult(thread_reply_text=action_result.error_message)
+        record_processed_event(
+            database, event.workspace_id, event.event_id, "message", event.author_id,
+            event.channel_id, event.thread_ts or event.event_ts, result, event.received_at,
         )
-
-    # Generate or reuse promise record
-    promise_id = f"p-{uuid.uuid4().hex[:8]}"
-    card = PromiseCardData(
-        promise_id=promise_id,
-        owner_id=event.author_id,
-        action=action_text,
-        deadline_text=deadline_text,
-        status="pending_confirmation",
-    )
-    _PROMISES_CACHE[promise_id] = card
-
-    logger.info(
-        "Detected promise '%s' for owner %s: '%s' (deadline: %s)",
-        promise_id,
-        event.author_id,
-        action_text,
-        deadline_text or "none",
-    )
-
-    return PipelineResult(
-        processed=True,
-        should_respond=True,
-        promise_card=card,
-    )
+    return result
 
 
-def handle_user_action(action: UserAction) -> ActionResult:
-    """Handle deterministic user action (confirm, dismiss, complete, snooze).
-
-    Validates that the acting user is the promise owner before mutating state.
-    """
-    logger.info(
-        "Handling user action '%s' on promise '%s' by actor '%s'",
-        action.action_name,
-        action.promise_id,
-        action.actor_id,
-    )
-
-    card = _PROMISES_CACHE.get(action.promise_id)
-
-    # If not in cache (e.g. after restart), build a placeholder representation
-    if not card:
-        card = PromiseCardData(
-            promise_id=action.promise_id,
-            owner_id=action.actor_id,
-            action="Tracked commitment",
-            status="pending_confirmation",
+def handle_user_action(action: UserAction, database: sqlite3.Connection) -> ActionResult:
+    with database:
+        database.execute("BEGIN IMMEDIATE")
+        processed = get_processed_event(database, action.workspace_id, action.event_id, "action")
+        if processed:
+            if (
+                processed["actor_id"] != action.actor_id
+                or processed["channel_id"] != action.channel_id
+                or processed["target_ts"] != action.message_ts
+            ):
+                return ActionResult(
+                    success=False, error_message="Action metadata does not match the original event.",
+                )
+            previous = ActionResult.model_validate_json(processed["result_json"])
+            if previous.success:
+                if previous.updated_card.promise_id != action.promise_id:
+                    return ActionResult(
+                        success=False, error_message="Action metadata does not match the original event.",
+                    )
+                promise = get_promise(database, action.promise_id)
+                if promise is None or promise.workspace_id != action.workspace_id or promise.owner_id != action.actor_id:
+                    return ActionResult(success=False, error_message="Promise not found.")
+                return ActionResult(
+                    success=True, updated_card=promise.card(), notification_text="Action already processed.",
+                )
+            return previous
+        result = execute_tool(database, action, require_card=True)
+        record_processed_event(
+            database, action.workspace_id, action.event_id, "action", action.actor_id,
+            action.channel_id, action.message_ts, result, action.received_at,
         )
-        _PROMISES_CACHE[action.promise_id] = card
-
-    # Enforce authorization: only the promise owner can confirm or complete
-    if action.actor_id != card.owner_id:
-        logger.warning(
-            "Unauthorized action '%s' by actor %s on promise %s (owner: %s)",
-            action.action_name,
-            action.actor_id,
-            action.promise_id,
-            card.owner_id,
-        )
-        return ActionResult(
-            success=False,
-            error_message=f"Only the promise owner (<@{card.owner_id}>) can {action.action_name} this promise.",
-        )
-
-    # State transitions
-    new_status = card.status
-    notification = None
-
-    if action.action_name == "confirm":
-        new_status = "confirmed"
-        notification = "Promise confirmed!"
-    elif action.action_name == "complete":
-        new_status = "completed"
-        notification = "Promise marked as complete! 🎉"
-    elif action.action_name == "dismiss":
-        new_status = "dismissed"
-        notification = "Promise dismissed."
-    elif action.action_name == "snooze":
-        notification = "Reminder snoozed."
-    else:
-        return ActionResult(
-            success=False,
-            error_message=f"Unknown action '{action.action_name}'",
-        )
-
-    updated_card = PromiseCardData(
-        promise_id=card.promise_id,
-        owner_id=card.owner_id,
-        action=card.action,
-        deadline_text=card.deadline_text,
-        status=new_status,
-    )
-    _PROMISES_CACHE[action.promise_id] = updated_card
-
-    return ActionResult(
-        success=True,
-        updated_card=updated_card,
-        notification_text=notification,
-    )
+    return result
