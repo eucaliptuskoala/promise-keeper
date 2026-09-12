@@ -35,10 +35,14 @@ def model_tools() -> list[ChatCompletionFunctionToolParam]:
     for name, (operation, description, fields) in MODEL_TOOL_DEFINITIONS.items():
         arguments = {}
         for field in fields:
-            if operation == "create" and field in ("deadline_text", "deadline_at"):
-                arguments[field] = {key: value for key, value in properties[field].items() if key != "default"}
-            else:
-                arguments[field] = next(schema for schema in properties[field]["anyOf"] if schema["type"] != "null")
+            schema = {key: value for key, value in properties[field].items() if key != "default"}
+            if not (operation == "create" and field in ("deadline_text", "deadline_at")) and "anyOf" in schema:
+                variants = [variant for variant in schema.pop("anyOf") if variant.get("type") != "null"]
+                if len(variants) == 1:
+                    schema.update(variants[0])
+                else:
+                    schema["anyOf"] = variants
+            arguments[field] = schema
         tools.append({
             "type": "function",
             "function": {

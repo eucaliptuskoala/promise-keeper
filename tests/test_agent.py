@@ -1,14 +1,15 @@
 import json
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from openai.types.chat import ChatCompletion
 
 from promise_keeper.agent import run_agent
-from promise_keeper.models import NormalizedEvent, UserAction
+from promise_keeper.models import AgentDecision, NormalizedEvent, UserAction
 from promise_keeper.pipeline import handle_user_action
 from promise_keeper.storage import bind_card, get_promise, initialize_storage
+from promise_keeper.tools import model_tools
 
 
 def tool_response(name: str, arguments: dict, call_id: str = "call-1") -> ChatCompletion:
@@ -44,12 +45,7 @@ def database(tmp_path):
 @pytest.fixture
 def client():
     instance = MagicMock()
-    acknowledgement = ChatCompletion.model_validate({
-        "id": "synthetic-ack", "created": 0, "model": "configured-model", "object": "chat.completion",
-        "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "Acknowledged."}}],
-    })
-    instance.chat.completions.create.return_value = acknowledgement
-    instance.chat.completions.create.side_effect = [tool_response("ignore_message", {}), acknowledgement]
+    instance.chat.completions.create.side_effect = [tool_response("ignore_message", {})]
     return instance
 
 
@@ -60,7 +56,7 @@ def create_arguments():
 
 
 def set_tool(client, response) -> None:
-    client.chat.completions.create.side_effect = [response, client.chat.completions.create.return_value]
+    client.chat.completions.create.side_effect = [response]
 
 
 def test_model_gets_source_time_and_narrow_native_tools(event, database, client) -> None:
@@ -86,9 +82,31 @@ def test_model_gets_source_time_and_narrow_native_tools(event, database, client)
         assert not {"owner_id", "workspace_id", "channel_id", "operation"} & set(schema["properties"])
     instructions = arguments["messages"][0]["content"]
     assert all(word in instructions for word in ("untrusted", "quotations", "hypotheticals", "unaccepted requests"))
+    assert "ISO 8601" in instructions
+    assert "UTC offset" in instructions
+    assert "+02:00" in instructions and "or Z" in instructions
     assert len(arguments["messages"]) == 2
+    assert [message["role"] for message in arguments["messages"]] == ["system", "user"]
+    assert client.chat.completions.create.call_count == 1
     assert tools["create_promise"]["parameters"]["properties"]["action"]["type"] == "string"
     assert tools["reschedule_promise"]["parameters"]["properties"]["deadline_at"]["type"] == "string"
+
+
+@pytest.mark.parametrize("field", ["action", "evidence", "deadline_at"])
+def test_tools_accept_non_nullable_field_schemas(field) -> None:
+    schema = AgentDecision.model_json_schema()
+    field_schema = schema["properties"][field]
+    field_schema.update(field_schema.pop("anyOf")[0])
+    with patch.object(AgentDecision, "model_json_schema", return_value=schema):
+        tools = {tool["function"]["name"]: tool["function"] for tool in model_tools()}
+    argument = tools["create_promise"]["parameters"]["properties"][field]
+    assert argument["type"] == "string"
+    assert argument["title"] == field_schema["title"]
+    assert "default" not in argument
+    if field == "deadline_at":
+        assert argument["format"] == "date-time"
+    else:
+        assert argument["minLength"] == 1
 
 
 def test_create_preserves_an_unstated_deadline(event, database, client, create_arguments) -> None:
@@ -101,7 +119,7 @@ def test_create_preserves_an_unstated_deadline(event, database, client, create_a
 
 def test_initial_model_timeout_allows_event_recovery(event, database, client, create_arguments) -> None:
     client.chat.completions.create.side_effect = [
-        TimeoutError(), tool_response("create_promise", create_arguments), client.chat.completions.create.return_value,
+        TimeoutError(), tool_response("create_promise", create_arguments),
     ]
     assert run_agent(event, database, client, "configured-model", "UTC").status == "failed"
     assert database.execute("SELECT COUNT(*) FROM processed_events").fetchone()[0] == 0
@@ -114,15 +132,9 @@ def test_create_returns_actual_committed_result_and_suppresses_duplicates(event,
     result = run_agent(event, database, client, "configured-model", "UTC")
     assert result.promise_card.status == "pending_confirmation"
     assert get_promise(database, result.promise_card.promise_id).owner_id == "alice"
-    feedback = client.chat.completions.create.call_args_list[1].kwargs
-    output = json.loads(feedback["messages"][-2]["content"])
-    assert feedback["messages"][-2]["tool_call_id"] == "call-1"
-    assert output["success"] is True
-    assert output["delivered"] is False
-    assert output["result"]["promise_card"]["promise_id"] == result.promise_card.promise_id
-    assert feedback["tool_choice"] == "none"
+    assert result.thread_reply_text is None
     assert run_agent(event, database, client, "configured-model", "UTC").status == "duplicate"
-    assert client.chat.completions.create.call_count == 2
+    assert client.chat.completions.create.call_count == 1
     assert database.execute("SELECT COUNT(*) FROM promises").fetchone()[0] == 1
 
 
@@ -134,6 +146,7 @@ def test_create_returns_actual_committed_result_and_suppresses_duplicates(event,
     ("complete_promise", {"promise_id": "missing", "evidence": "I'll send designs", "action": "Overwrite"}),
     ("create_promise", {"action": "Send designs", "evidence": "invented", "deadline_text": None, "deadline_at": None}),
     ("create_promise", {"action": "Send designs", "evidence": "I'll send designs", "deadline_text": "tomorrow", "deadline_at": "2026-09-13T12:00:00Z"}),
+    ("create_promise", {"action": "Send designs", "evidence": "I'll send designs", "deadline_text": "by noon today", "deadline_at": "2026-09-12T12:00:00"}),
     ("reschedule_promise", {"promise_id": "missing", "evidence": "I'll send designs", "deadline_text": "by noon today", "deadline_at": "2026-09-12T12:00:00Z"}),
 ])
 def test_invalid_or_ungrounded_calls_do_not_write(event, database, client, name, arguments) -> None:
@@ -171,25 +184,20 @@ def test_clarification_is_a_tool_result(event, database, client) -> None:
     set_tool(client, tool_response("ask_clarification", {"clarification": "Which designs?"}))
     result = run_agent(event, database, client, "configured-model", "UTC")
     assert result.thread_reply_text == "Which designs?"
-    assert json.loads(client.chat.completions.create.call_args.kwargs["messages"][-2]["content"])["success"] is True
+    assert client.chat.completions.create.call_count == 1
 
 
-@pytest.mark.parametrize("acknowledgement", ["timeout", "extra_call", "false_prose"])
-def test_acknowledgement_cannot_change_or_lose_committed_effect(event, database, client, create_arguments, acknowledgement) -> None:
-    final = tool_response("complete_promise", {"promise_id": "invented", "evidence": "invented"})
-    if acknowledgement == "timeout":
-        final = TimeoutError("synthetic timeout")
-    elif acknowledgement == "false_prose":
-        final.choices[0].finish_reason = "stop"
-        final.choices[0].message.tool_calls = None
-        final.choices[0].message.content = "The promise is already completed and delivered."
-    client.chat.completions.create.side_effect = [tool_response("create_promise", create_arguments), final]
+def test_model_prose_cannot_replace_committed_card(event, database, client, create_arguments) -> None:
+    response = tool_response("create_promise", create_arguments)
+    response.choices[0].message.content = "The promise is already completed and delivered."
+    set_tool(client, response)
     result = run_agent(event, database, client, "configured-model", "UTC")
     assert result.promise_card.status == "pending_confirmation"
     assert result.thread_reply_text is None
     assert get_promise(database, result.promise_card.promise_id).status == "pending_confirmation"
     assert database.execute("SELECT COUNT(*) FROM promise_history").fetchone()[0] == 1
     assert run_agent(event, database, client, "configured-model", "UTC").status == "duplicate"
+    assert client.chat.completions.create.call_count == 1
 
 
 def test_native_reschedule_and_completion_use_owner_and_state_rules(event, database, client, create_arguments) -> None:
@@ -206,19 +214,18 @@ def test_native_reschedule_and_completion_use_owner_and_state_rules(event, datab
     client.chat.completions.create.side_effect = [
         tool_response("reschedule_promise", {"promise_id": promise.promise_id, "evidence": "I'll send designs",
                                              "deadline_text": "tomorrow", "deadline_at": "2026-09-16T12:00:00Z"}),
-        TimeoutError(),
     ]
     assert run_agent(moved, database, client, "configured-model", "UTC").promise_card.deadline_text == "tomorrow"
     done = moved.model_copy(update={"event_id": "done", "text": "Sent designs.",
                                    "event_ts": f"{int((now + timedelta(minutes=2)).timestamp())}.000001"})
     client.chat.completions.create.side_effect = [
-        tool_response("complete_promise", {"promise_id": promise.promise_id, "evidence": "Sent designs"}), TimeoutError(),
+        tool_response("complete_promise", {"promise_id": promise.promise_id, "evidence": "Sent designs"}),
     ]
     denied = run_agent(done.model_copy(update={"author_id": "bob", "event_id": "bob-done"}), database, client, "configured-model", "UTC")
     assert denied.status == "failed"
     assert get_promise(database, promise.promise_id).status == "confirmed"
     client.chat.completions.create.side_effect = [
-        tool_response("complete_promise", {"promise_id": promise.promise_id, "evidence": "Sent designs"}), TimeoutError(),
+        tool_response("complete_promise", {"promise_id": promise.promise_id, "evidence": "Sent designs"}),
     ]
     assert run_agent(done, database, client, "configured-model", "UTC").promise_card.status == "completed"
 
@@ -229,9 +236,9 @@ def test_denied_pending_completion_is_reported_as_failure(event, database, clien
     done = event.model_copy(update={"event_id": "pending-done", "text": "Sent designs.",
                                    "event_ts": f"{int(event.occurred_at.timestamp()) + 60}.000001"})
     client.chat.completions.create.side_effect = [
-        tool_response("complete_promise", {"promise_id": promise.promise_id, "evidence": "Sent designs"}), TimeoutError(),
+        tool_response("complete_promise", {"promise_id": promise.promise_id, "evidence": "Sent designs"}),
     ]
     result = run_agent(done, database, client, "configured-model", "UTC")
     assert "Confirm" in result.thread_reply_text
-    assert json.loads(client.chat.completions.create.call_args.kwargs["messages"][-2]["content"])["success"] is False
+    assert client.chat.completions.create.call_count == 2
     assert get_promise(database, promise.promise_id).status == "pending_confirmation"

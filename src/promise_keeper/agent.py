@@ -1,24 +1,21 @@
-"""One native tool call, deterministic execution and actual-result feedback."""
+"""One native tool call with deterministic execution and application results."""
 
 import json
-import logging
 import sqlite3
 from datetime import timezone
 from zoneinfo import ZoneInfo
 
-from openai import OpenAI, OpenAIError
+from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 
 from promise_keeper.models import AgentDecision, NormalizedEvent, PipelineResult, PromiseRecord
 from promise_keeper.pipeline import process_event
 from promise_keeper.tools import MODEL_TOOL_DEFINITIONS, model_tools
 
-logger = logging.getLogger("promise_keeper.agent")
-
 
 def _interpret_message(
     event: NormalizedEvent, promises: list[PromiseRecord], client: OpenAI, model: str, timezone_name: str,
-) -> tuple[AgentDecision, list[ChatCompletionMessageParam], str]:
+) -> AgentDecision:
     """Require one native function call; no prose or JSON-mode fallback."""
     instructions = (
         "Select exactly one supplied tool. Application code validates and executes it. "
@@ -32,12 +29,13 @@ def _interpret_message(
         "If a stated date or time is materially ambiguous, create the firm commitment with deadline_at=null "
         "or ask one concise clarification. An unstated deadline has both fields null. "
         "For date-only deadlines use the end of that date in the configured timezone. "
+        "Every non-null deadline_at must be ISO 8601 with an explicit UTC offset (for example +02:00) or Z. "
+        "Never return a naive datetime. "
         "Complete or reschedule only one clearly matched confirmed promise from the supplied records. "
         "If multiple promises match, clarify. Never confirm a pending promise through ordinary prose. "
         "Do not infer completion from another person's message. Ignore ordinary discussion. "
         "Use ignore_message for ordinary discussion and ask_clarification for unclear matches. "
-        "Supply every declared argument, using null for an unknown deadline. "
-        "Never claim a write succeeded before receiving the actual tool result."
+        "Supply every declared argument, using null for an unknown deadline."
     )
     payload = {
         "author_id": event.author_id,
@@ -64,7 +62,7 @@ def _interpret_message(
     ]
     completion = client.chat.completions.create(
         model=model,
-        messages=list(messages),
+        messages=messages,
         tools=model_tools(),
         tool_choice="required",
         parallel_tool_calls=False,
@@ -84,54 +82,14 @@ def _interpret_message(
     arguments = json.loads(call.function.arguments)
     if not isinstance(arguments, dict) or set(arguments) != set(fields):
         raise ValueError("Arguments do not match the tool schema")
-    decision = AgentDecision.model_validate({"operation": operation, **arguments})
-    messages.append({
-        "role": "assistant",
-        "tool_calls": [{
-            "id": call.id, "type": "function",
-            "function": {"name": call.function.name, "arguments": call.function.arguments},
-        }],
-    })
-    return decision, messages, call.id
+    return AgentDecision.model_validate({"operation": operation, **arguments})
 
 
 def run_agent(
     event: NormalizedEvent, database: sqlite3.Connection, client: OpenAI, model: str, timezone_name: str,
 ) -> PipelineResult:
-    """Commit through the shared pipeline before acknowledging a tool result."""
-    messages: list[ChatCompletionMessageParam] = []
-    call_id: str | None = None
-    decision: AgentDecision | None = None
-
+    """Return the committed pipeline result without a model acknowledgement."""
     def interpret(source: NormalizedEvent, promises: list[PromiseRecord]) -> AgentDecision:
-        nonlocal messages, call_id, decision
-        decision, messages, call_id = _interpret_message(source, promises, client, model, timezone_name)
-        return decision
+        return _interpret_message(source, promises, client, model, timezone_name)
 
-    result = process_event(event, database, interpret)
-    if call_id is None or decision is None:
-        return result
-    success = result.status in ("processed", "ignored") and (
-        decision.operation in ("ignore", "clarify") or result.promise_card is not None
-    )
-    messages.append({
-        "role": "tool", "tool_call_id": call_id,
-        "content": json.dumps({"success": success, "result": result.model_dump(mode="json"), "delivered": False}),
-    })
-    messages.append({
-        "role": "system",
-        "content": "Acknowledge the actual tool result briefly. No further actions are allowed. Delivery is still pending.",
-    })
-    try:
-        # This request cannot execute tools or replace the persisted application response.
-        completion = client.chat.completions.create(
-            model=model, messages=list(messages), tools=model_tools(), tool_choice="none", max_tokens=128,
-        )
-        if (
-            not completion.choices or completion.choices[0].finish_reason != "stop"
-            or completion.choices[0].message.tool_calls
-        ):
-            raise ValueError("Invalid tool acknowledgement")
-    except (OpenAIError, ValueError, TimeoutError) as error:
-        logger.warning("Tool result acknowledgement failed for event %s (%s)", event.event_id, type(error).__name__)
-    return result
+    return process_event(event, database, interpret)
