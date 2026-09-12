@@ -176,9 +176,13 @@ def execute_tool(database: sqlite3.Connection, action: UserAction, require_card:
                         seconds=dependent.relative_deadline_seconds,
                     )
                     dep_changes["deadline_at"] = dep_deadline
-                    days = dependent.relative_deadline_seconds // 86400
-                    hours = dependent.relative_deadline_seconds // 3600
-                    dep_changes["deadline_text"] = f"Within {days} days" if dependent.relative_deadline_seconds % 86400 == 0 else f"Within {hours} hours"
+                    secs = dependent.relative_deadline_seconds
+                    if secs % 86400 == 0:
+                        dep_changes["deadline_text"] = f"Within {secs // 86400} days"
+                    elif secs >= 3600:
+                        dep_changes["deadline_text"] = f"Within {secs // 3600} hours"
+                    else:
+                        dep_changes["deadline_text"] = f"Within {secs // 60} minutes"
                 updated_dep = PromiseRecord.model_validate({**dependent.model_dump(), **dep_changes})
                 save_promise(database, updated_dep)
                 record_history(
