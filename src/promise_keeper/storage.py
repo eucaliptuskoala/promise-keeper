@@ -2,9 +2,11 @@
 
 import json
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from promise_keeper.models import ActionResult, PipelineResult, PromiseRecord
+
 
 
 def initialize_storage(path: str) -> sqlite3.Connection:
@@ -53,8 +55,14 @@ def initialize_storage(path: str) -> sqlite3.Connection:
             promise_id TEXT NOT NULL REFERENCES promises(promise_id),
             PRIMARY KEY(workspace_id, channel_id, message_ts)
         );
+        CREATE TABLE IF NOT EXISTS app_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
     """)
     return database
+
 
 
 def get_promise(database: sqlite3.Connection, promise_id: str) -> PromiseRecord | None:
@@ -223,3 +231,66 @@ def pending_responses(database: sqlite3.Connection, workspace_id: str, now: date
            ORDER BY retry_at LIMIT 20""",
         (workspace_id, now.timestamp()),
     ).fetchall()
+
+
+def get_app_metadata(database: sqlite3.Connection, key: str) -> str | None:
+    row = database.execute("SELECT value FROM app_metadata WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_app_metadata(database: sqlite3.Connection, key: str, value: str, now: datetime) -> None:
+    database.execute(
+        """INSERT INTO app_metadata (key, value, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
+        (key, value, now.isoformat()),
+    )
+
+
+def get_last_monthly_report(database: sqlite3.Connection, workspace_id: str, channel_id: str) -> str | None:
+    return get_app_metadata(database, f"monthly_report:{workspace_id}:{channel_id}")
+
+
+def record_monthly_report(
+    database: sqlite3.Connection, workspace_id: str, channel_id: str, month_key: str, now: datetime,
+) -> None:
+    set_app_metadata(database, f"monthly_report:{workspace_id}:{channel_id}", month_key, now)
+
+
+def get_unfulfilled_stats(
+    database: sqlite3.Connection, workspace_id: str, channel_id: str, now: datetime,
+) -> list[dict[str, Any]]:
+    """Aggregate unfulfilled commitments (confirmed/waiting with deadline_at < now) grouped by owner."""
+    now_utc = now.astimezone(timezone.utc)
+    if channel_id == "*":
+        rows = database.execute(
+            "SELECT record_json FROM promises WHERE workspace_id = ?",
+            (workspace_id,),
+        ).fetchall()
+    else:
+        rows = database.execute(
+            "SELECT record_json FROM promises WHERE workspace_id = ? AND channel_id = ?",
+            (workspace_id, channel_id),
+        ).fetchall()
+    promises = [PromiseRecord.model_validate_json(row["record_json"]) for row in rows]
+    overdue_by_owner: dict[str, list[PromiseRecord]] = {}
+    for promise in promises:
+        if (
+            promise.status in ("confirmed", "waiting")
+            and promise.deadline_at is not None
+            and promise.deadline_at < now_utc
+        ):
+            overdue_by_owner.setdefault(promise.owner_id, []).append(promise)
+
+    leaderboard = []
+    for owner_id, items in overdue_by_owner.items():
+        sorted_items = sorted(items, key=lambda p: p.deadline_at or now_utc)
+        leaderboard.append({
+            "owner_id": owner_id,
+            "overdue_count": len(items),
+            "sample_actions": [p.action for p in sorted_items[:3]],
+            "oldest_deadline_at": sorted_items[0].deadline_at,
+        })
+
+    leaderboard.sort(key=lambda entry: (-entry["overdue_count"], entry["oldest_deadline_at"] or now_utc))
+    return leaderboard
+

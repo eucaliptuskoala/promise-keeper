@@ -5,8 +5,10 @@ import logging
 import signal
 from contextlib import closing
 from datetime import datetime, timezone
+from typing import Any
 
 from dotenv import load_dotenv
+
 from openai import OpenAI
 from pydantic import ValidationError
 
@@ -15,7 +17,18 @@ from promise_keeper.config import load_settings
 from promise_keeper.models import ActionResult, AgentDecision, NormalizedEvent, PipelineResult, PromiseRecord, UserAction
 from promise_keeper.pipeline import handle_user_action, process_event
 from promise_keeper.reminders import check_reminders
-from promise_keeper.storage import bind_card, get_promise, initialize_storage, pending_responses, record_delivery
+from promise_keeper.storage import (
+
+    bind_card,
+    get_last_monthly_report,
+    get_promise,
+    get_unfulfilled_stats,
+    initialize_storage,
+    pending_responses,
+    record_delivery,
+    record_monthly_report,
+)
+
 
 logger = logging.getLogger("promise_keeper")
 
@@ -84,8 +97,14 @@ def main(argv: list[str] | None = None) -> None:
                 with database:
                     bind_card(database, adapter.workspace_id, channel_id, message_ts, promise_id)
 
+        def get_stats(workspace_id: str, channel_id: str) -> list[dict[str, Any]]:
+            now = datetime.now(timezone.utc)
+            with closing(initialize_storage(settings.database_path)) as database:
+                return get_unfulfilled_stats(database, workspace_id, channel_id, now)
+
         def tick() -> None:
             now = datetime.now(timezone.utc)
+            current_month_key = now.strftime("%Y-%m")
             with closing(initialize_storage(settings.database_path)) as database:
                 for row in pending_responses(database, adapter.workspace_id, now):
                     if row["kind"] == "message":
@@ -107,12 +126,24 @@ def main(argv: list[str] | None = None) -> None:
                         database, adapter.workspace_id, row["event_id"], row["kind"], message_ts, now,
                     )
                 check_reminders(database, adapter.send_owner_reminder, now, adapter.workspace_id, settings.enabled_channels)
+                for channel_id in settings.enabled_channels:
+                    if channel_id == "*":
+                        continue
+                    last_month = get_last_monthly_report(database, adapter.workspace_id, channel_id)
+                    if last_month != current_month_key:
+                        stats = get_unfulfilled_stats(database, adapter.workspace_id, channel_id, now)
+                        delivered = adapter.send_channel_leaderboard(channel_id, stats, is_monthly=True)
+                        if delivered:
+                            with database:
+                                record_monthly_report(database, adapter.workspace_id, channel_id, current_month_key, now)
 
         adapter = SlackAdapter(
             bot_token=settings.slack_bot_token, app_token=settings.slack_app_token,
             process_event_fn=process, handle_action_fn=handle_action, enabled_channels=settings.enabled_channels,
             record_delivery_fn=acknowledge_delivery, record_reminder_fn=acknowledge_reminder, tick_fn=tick,
+            stats_fn=get_stats,
         )
+
 
         def shutdown(signum, frame) -> None:
             adapter.stop()

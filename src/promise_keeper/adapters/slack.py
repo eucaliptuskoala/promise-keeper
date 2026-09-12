@@ -172,6 +172,70 @@ def build_reminder_card(notification: ReminderNotification) -> list[dict[str, An
     return blocks
 
 
+def build_leaderboard_card(stats: list[dict[str, Any]], is_monthly: bool = False) -> list[dict[str, Any]]:
+    """Build Slack Block Kit representation for unfulfilled commitments leaderboard."""
+    if is_monthly:
+        title = "*Ежемесячный отчёт по сорванным дедлайнам* :trophy:"
+        subtitle = "Итоги месяца по невыполненным обязательствам в канале."
+    else:
+        title = "*Доска фуфлыжников (Анти-топ сорванных дедлайнов)* :trophy:"
+        subtitle = "Текущий список участников с просроченными обещаниями."
+
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"{title}\n_{subtitle}_",
+            },
+        },
+        {"type": "divider"},
+    ]
+
+    if not stats:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": ":tada: *Все молодцы!* В этом канале нет сорванных дедлайнов. Все обещания закрыты вовремя.",
+                },
+            }
+        )
+        return blocks
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for rank, entry in enumerate(stats, start=1):
+        medal = medals[rank - 1] if rank <= 3 else "🔹"
+        count = entry["overdue_count"]
+        if count % 10 == 1 and count % 100 != 11:
+            word = "просроченное обещание"
+        elif 2 <= count % 10 <= 4 and (count % 100 < 10 or count % 100 >= 20):
+            word = "просроченных обещания"
+        else:
+            word = "просроченных обещаний"
+
+        sample = ""
+        if entry.get("sample_actions"):
+            action_escaped = escape(entry["sample_actions"][0], quote=False)[:100]
+            sample = f"\n    _«{action_escaped}»_"
+
+        lines.append(f"{medal} *{rank}.* <@{entry['owner_id']}> — *{count}* {word}{sample}")
+
+    blocks.append(
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "\n\n".join(lines),
+            },
+        }
+    )
+    return blocks
+
+
+
 class SlackAdapter:
     """Normalize input and deliver core results through Slack."""
 
@@ -185,6 +249,7 @@ class SlackAdapter:
         record_delivery_fn: Callable[[str, str, str | None], None],
         record_reminder_fn: Callable[[str, str, str], None],
         tick_fn: Callable[[], None] | None = None,
+        stats_fn: Callable[[str, str], list[dict[str, Any]]] | None = None,
     ) -> None:
         self.process_event_fn = process_event_fn
         self.handle_action_fn = handle_action_fn
@@ -192,7 +257,9 @@ class SlackAdapter:
         self.record_delivery_fn = record_delivery_fn
         self.record_reminder_fn = record_reminder_fn
         self.tick_fn = tick_fn
+        self.stats_fn = stats_fn
         self._processing_lock = RLock()
+
         self._stopped = Event()
         self._ticker: Thread | None = None
         self._context: OrderedDict[tuple[str, str], tuple[ContextMessage, ...]] = OrderedDict()
@@ -273,17 +340,60 @@ class SlackAdapter:
             context.append(ContextMessage(user_id=message["user"], text=message["text"][:8000], ts=message["ts"]))
         return sorted(context, key=lambda message: Decimal(message.ts))
 
+    def is_stats_command(self, text: str) -> bool:
+        lower = text.lower()
+        if self.bot_user_id and f"<@{self.bot_user_id.lower()}>" in lower and "stats" in lower:
+            return True
+        if "@promise keeper" in lower and "stats" in lower:
+            return True
+        if re.search(r"^\s*!stats\b", lower):
+            return True
+        return False
+
+    def send_channel_leaderboard(
+        self, channel_id: str, stats: list[dict[str, Any]], is_monthly: bool = True,
+    ) -> str | None:
+        if channel_id not in self.enabled_channels:
+            return None
+        blocks = build_leaderboard_card(stats, is_monthly=is_monthly)
+        title = "Ежемесячный отчёт по сорванным дедлайнам" if is_monthly else "Доска фуфлыжников"
+        try:
+            response = self.app.client.chat_postMessage(
+                channel=channel_id,
+                text=title,
+                blocks=blocks,
+            )
+            return response.get("ts")
+        except SlackApiError as error:
+            logger.warning("Failed to post channel leaderboard (%s)", error.response.get("error", "slack_error"))
+            return None
+
     def _handle_inbound_message(self, event: dict[str, Any], event_id: str | None = None) -> None:
         user_id = event.get("user")
         channel_id = event.get("channel")
         if event.get("bot_id") or event.get("subtype") or user_id == self.bot_user_id:
             return
-        if channel_id not in self.enabled_channels or not user_id or not event.get("text", "").strip():
+        text = event.get("text", "").strip()
+        if channel_id not in self.enabled_channels or not user_id or not text:
             return
         event_ts = event.get("ts", "")
         thread_ts = event.get("thread_ts")
+        if self.is_stats_command(text):
+            stats = self.stats_fn(self.workspace_id, channel_id) if self.stats_fn else []
+            blocks = build_leaderboard_card(stats, is_monthly=False)
+            try:
+                self.app.client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=thread_ts,
+                    text="Доска фуфлыжников (Анти-топ сорванных дедлайнов)",
+                    blocks=blocks,
+                )
+            except SlackApiError as error:
+                logger.warning("Failed to post stats leaderboard (%s)", error.response.get("error", "slack_error"))
+            return
         key = (channel_id, thread_ts or "channel")
         context = list(self._context.get(key, ()))
+
         try:
             if thread_ts and thread_ts != event_ts:
                 context += self._fetch_thread_context(channel_id, thread_ts, event_ts)
