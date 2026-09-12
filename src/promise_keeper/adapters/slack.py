@@ -471,6 +471,16 @@ class SlackAdapter:
             if self.tick_fn:
                 self.tick_fn()
 
+    def _get_message_permalink(self, channel_id: str, message_ts: str) -> str | None:
+        try:
+            source = self.app.client.chat_getPermalink(channel=channel_id, message_ts=message_ts)
+            return source.get("permalink")
+        except SlackApiError as error:
+            logger.warning("Original message link unavailable (%s)", error.response.get("error", "slack_error"))
+        except Exception as error:
+            logger.warning("Original message link unavailable (%s)", type(error).__name__)
+        return None
+
     def deliver_result(
         self, channel_id: str, target_ts: str, kind: str, result: PipelineResult | ActionResult,
     ) -> str | None:
@@ -486,15 +496,7 @@ class SlackAdapter:
                 if not channel_id or not channel_id.startswith("D"):
                     return None
             if card and channel_id.startswith("D") and card.channel_id and card.source_message_id:
-                try:
-                    source = self.app.client.chat_getPermalink(
-                        channel=card.channel_id, message_ts=card.source_message_id,
-                    )
-                    source_url = source.get("permalink")
-                except SlackApiError as error:
-                    logger.warning("Original message link unavailable (%s)", error.response.get("error", "slack_error"))
-                except Exception as error:
-                    logger.warning("Original message link unavailable (%s)", type(error).__name__)
+                source_url = self._get_message_permalink(card.channel_id, card.source_message_id)
             arguments: dict[str, Any] = {
                 "channel": channel_id, "text": escape(text, quote=False),
             }
@@ -610,15 +612,7 @@ class SlackAdapter:
                 return False
             source_url = None
             if notification.source_message_id is not None:
-                try:
-                    source = self.app.client.chat_getPermalink(
-                        channel=notification.channel_id, message_ts=notification.source_message_id,
-                    )
-                    source_url = source.get("permalink")
-                except SlackApiError as error:
-                    logger.warning("Original message link unavailable (%s)", error.response.get("error", "slack_error"))
-                except Exception as error:
-                    logger.warning("Original message link unavailable (%s)", type(error).__name__)
+                source_url = self._get_message_permalink(notification.channel_id, notification.source_message_id)
             message = self.app.client.chat_postMessage(
                 channel=channel_id,
                 text=escape(f"Reminder: {notification.action}", quote=False),

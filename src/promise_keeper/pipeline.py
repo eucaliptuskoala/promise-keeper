@@ -13,7 +13,6 @@ from promise_keeper.models import (
     CardUpdate,
     NormalizedEvent,
     PipelineResult,
-    PromiseRecord,
     UserAction,
 )
 from promise_keeper.storage import (
