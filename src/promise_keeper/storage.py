@@ -1,7 +1,6 @@
 """SQLite records, chronological history and recoverable outbound responses."""
 
 import json
-import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -400,15 +399,4 @@ def get_monthly_missed_deadline_stats(
         if completed_late or still_overdue:
             missed.append(promise)
     return _aggregate_stats(missed, end)
-
-
-def get_channel_dominant_language(
-    database: sqlite3.Connection, workspace_id: str, channel_id: str,
-) -> str:
-    """Return 'ru' if the majority of promises in the channel are in Russian, otherwise 'en'."""
-    promises = _channel_promises(database, workspace_id, channel_id)
-    if not promises:
-        return "en"
-    ru_count = sum(1 for promise in promises if re.search(r"[\u0400-\u04FF]", promise.action))
-    return "ru" if ru_count > len(promises) / 2 else "en"
 

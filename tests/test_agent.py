@@ -86,6 +86,7 @@ def test_model_gets_source_time_and_narrow_native_tools(event, database, client)
     assert "ISO 8601" in instructions
     assert "UTC offset" in instructions
     assert "+02:00" in instructions and "or Z" in instructions
+    assert "fallback should only be in English" in instructions
     assert len(arguments["messages"]) == 2
     assert [message["role"] for message in arguments["messages"]] == ["system", "user"]
     assert client.chat.completions.create.call_count == 1
