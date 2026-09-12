@@ -178,6 +178,27 @@ class SlackAdapter:
         self.workspace_id = auth.get("team_id", "")
         if not self.bot_user_id or not self.workspace_id:
             raise ValueError("Slack authentication did not return bot and workspace identities")
+        if enabled_channels == ("*",):
+            channels = []
+            cursor = None
+            for _ in range(20):
+                response = self.app.client.conversations_list(
+                    types="public_channel", exclude_archived=True, limit=200, cursor=cursor,
+                )
+                channels.extend(
+                    channel["id"] for channel in response.get("channels", [])
+                    if channel.get("id") and channel.get("is_channel")
+                    and not channel.get("is_private") and not channel.get("is_archived")
+                )
+                cursor = response.get("response_metadata", {}).get("next_cursor")
+                if not cursor:
+                    break
+            else:
+                raise ValueError("Public channel listing exceeded the startup page limit")
+            self.enabled_channels = tuple(dict.fromkeys(channels))
+            if not self.enabled_channels:
+                raise ValueError("No active public channels are available to the bot")
+            logger.info("Enabled all %d public channels; the bot receives messages where it is invited", len(self.enabled_channels))
         self._register_handlers()
         self.handler = SocketModeHandler(self.app, app_token)
 

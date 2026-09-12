@@ -17,16 +17,16 @@ python -m venv .venv
 
 The verified offline simulation runs Alice, Bob and Andrii through the real core using labelled scripted model decisions and a temporary synthetic database. It checks creation, confirmation, persistence after reopening SQLite, one captured private reminder and completion. It does not evaluate model understanding or deliver to Slack.
 
-For Slack, configure `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, and comma-separated `SLACK_ENABLED_CHANNELS` in environment variables or local `.env`. Existing `BOT_OAUTH_TOKEN` and `BOT_APP_TOKEN` names are accepted. Invite the bot to enabled public channels, enable Socket Mode and interactivity, subscribe to `message.channels`, and grant bot scopes `channels:history`, `chat:write`, `im:write`, plus app-level `connections:write`.
+For Slack, configure `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, and `SLACK_ENABLED_CHANNELS` in environment variables or local `.env`. Use `SLACK_ENABLED_CHANNELS=*` for all active public channels, or comma-separated channel IDs for a selected list. Public channels are resolved at startup; restart after creating a channel. Existing `BOT_OAUTH_TOKEN` and `BOT_APP_TOKEN` names are accepted. Invite the bot to the public channels where it should receive messages, enable Socket Mode and interactivity, subscribe to `message.channels`, and grant bot scopes `channels:read`, `channels:history`, `chat:write`, `im:write`, plus app-level `connections:write`.
 
-`OPENAI_BASE_URL` defaults to `https://api.aptget.nl/v1`; `OPENAI_MODEL` defaults to `qwen3.8-27b`. The OpenAI SDK requests one validated JSON decision per message, with no regex or fake-key fallback. `DATABASE_PATH` defaults to `promise_keeper.db` in the working directory; `APP_TIMEZONE` defaults to `UTC`. Windows named timezones use `tzdata`. `MODEL_TIMEOUT_SECONDS` defaults to 20 and accepts values greater than 0 and at most 60.
+`OPENAI_BASE_URL` defaults to `https://api.aptget.nl/v1`; `OPENAI_MODEL` defaults to `qwen3.8-27b`. The OpenAI SDK requests one native function call per message and executes it through the core. The actual result goes directly to the adapter, without another model request. There is no JSON-mode, regex or fake-key fallback. Cards reflect SQLite state, not model prose. `DATABASE_PATH` defaults to `promise_keeper.db` in the working directory; `APP_TIMEZONE` defaults to `UTC`. Windows named timezones use `tzdata`. `MODEL_TIMEOUT_SECONDS` defaults to 20 and accepts values greater than 0 and at most 60; an event uses at most one model request, without SDK retries.
 
 ```powershell
 .\.venv\Scripts\python.exe -m promise_keeper
 .\.venv\Scripts\python.exe -m promise_keeper --simulation --live-model
 ```
 
-Authenticated model generation and JSON mode remain unverified because no model key was available. Real Slack delivery is also unverified. Check an ordinary message without mentioning the bot, actual owner/non-owner clicks, a deadline change and private reminder delivery before relying on Slack mode.
+The live-model simulation passed against the configured gateway with a 60-second timeout; creation took about 29 seconds, exceeding the default 20. The example environment sets `MODEL_TIMEOUT_SECONDS=60`. Bot authentication, public-channel listing and app-token Socket Mode access also passed. Real Slack message delivery and buttons remain unverified. Check an ordinary message without mentioning the bot, actual owner/non-owner clicks, a deadline change and private reminder delivery before relying on Slack mode.
 
 ## Data and limits
 

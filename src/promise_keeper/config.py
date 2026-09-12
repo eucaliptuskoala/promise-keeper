@@ -21,6 +21,13 @@ class Settings(BaseModel):
     database_path: str = Field(default="promise_keeper.db", min_length=1)
     default_timezone: str = "UTC"
 
+    @field_validator("enabled_channels")
+    @classmethod
+    def validate_enabled_channels(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if "*" in value and value != ("*",):
+            raise ValueError("Use * alone for all public channels, or provide channel IDs")
+        return value
+
     @field_validator("default_timezone")
     @classmethod
     def validate_timezone(cls, value: str) -> str:
