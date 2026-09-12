@@ -1,0 +1,4 @@
+python-dotenv==1.2.3
+slack_bolt==1.30.0
+slack_sdk==3.44.1
+websocket-client==1.9.2
