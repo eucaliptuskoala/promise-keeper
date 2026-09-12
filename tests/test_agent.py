@@ -47,6 +47,16 @@ def test_model_gets_source_time_and_bounded_json_contract(event, client) -> None
     assert "unaccepted requests" in instructions
 
 
+def test_dependency_cues_require_a_candidate_match(event, client) -> None:
+    interpret_message(event, [], client, "configured-model", "UTC")
+
+    instructions = client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+
+    assert "but first" in instructions
+    assert "после" in instructions
+    assert "MUST set depends_on_promise_id" in instructions
+
+
 @pytest.mark.parametrize("content", [None, "not JSON", '{"operation":"create","action":"Send designs"}', '{"operation":"ignore","owner_id":"bob"}'])
 def test_invalid_model_responses_are_rejected(event, client, content) -> None:
     client.chat.completions.create.return_value.choices[0].message.content = content
