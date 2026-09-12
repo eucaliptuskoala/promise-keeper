@@ -42,3 +42,18 @@ def test_load_settings_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None
         load_settings()
 
     assert exc_info.value.errors()[0]["loc"] == ("openai_api_key",)
+
+
+def test_load_settings_slack_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("BOT_OAUTH_TOKEN", "xoxb-test")
+    monkeypatch.setenv("BOT_APP_TOKEN", "xapp-test")
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("SLACK_APP_TOKEN", raising=False)
+
+    settings = load_settings()
+    assert settings.slack_bot_token == "xoxb-test"
+    assert settings.slack_app_token == "xapp-test"
+    assert settings.database_path == "promise_keeper.db"
+    assert settings.default_timezone == "UTC"
+
