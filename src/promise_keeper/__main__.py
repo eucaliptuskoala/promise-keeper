@@ -5,8 +5,6 @@ import logging
 import signal
 from contextlib import closing
 from datetime import datetime, timezone
-from typing import Any
-
 from dotenv import load_dotenv
 
 from openai import OpenAI
@@ -14,19 +12,24 @@ from pydantic import ValidationError
 
 from promise_keeper.agent import run_agent
 from promise_keeper.config import load_settings
-from promise_keeper.models import ActionResult, NormalizedEvent, PipelineResult, UserAction
+from promise_keeper.models import ActionResult, LeaderboardEntry, NormalizedEvent, PipelineResult, UserAction
 from promise_keeper.pipeline import handle_user_action
 from promise_keeper.reminders import check_reminders
 from promise_keeper.storage import (
 
     bind_card,
+    claim_stats_command,
+    get_channel_dominant_language,
     get_last_monthly_report,
+    get_monthly_missed_deadline_stats,
+    get_monthly_report_attempts,
     get_promise,
     get_unfulfilled_stats,
     initialize_storage,
     pending_responses,
     record_delivery,
     record_monthly_report,
+    record_monthly_report_attempt,
 )
 
 
@@ -95,10 +98,19 @@ def main(argv: list[str] | None = None) -> None:
                 with database:
                     bind_card(database, adapter.workspace_id, channel_id, message_ts, promise_id)
 
-        def get_stats(workspace_id: str, channel_id: str) -> list[dict[str, Any]]:
+        def get_stats(workspace_id: str, channel_id: str) -> list[LeaderboardEntry]:
             now = datetime.now(timezone.utc)
             with closing(initialize_storage(settings.database_path)) as database:
                 return get_unfulfilled_stats(database, workspace_id, channel_id, now)
+
+        def claim_stats(workspace_id: str, event_id: str, channel_id: str) -> bool:
+            with closing(initialize_storage(settings.database_path)) as database:
+                with database:
+                    return claim_stats_command(database, workspace_id, event_id, channel_id, datetime.now(timezone.utc))
+
+        def get_channel_language(workspace_id: str, channel_id: str) -> str:
+            with closing(initialize_storage(settings.database_path)) as database:
+                return get_channel_dominant_language(database, workspace_id, channel_id)
 
         def tick() -> None:
             now = datetime.now(timezone.utc)
@@ -131,8 +143,14 @@ def main(argv: list[str] | None = None) -> None:
                     if last_month is None:
                         with database:
                             record_monthly_report(database, adapter.workspace_id, channel_id, current_month_key, now)
-                    elif last_month != current_month_key:
-                        stats = get_unfulfilled_stats(database, adapter.workspace_id, channel_id, now)
+                    elif last_month != current_month_key and get_monthly_report_attempts(
+                        database, adapter.workspace_id, channel_id, last_month,
+                    ) < 3:
+                        stats = get_monthly_missed_deadline_stats(
+                            database, adapter.workspace_id, channel_id, last_month,
+                        )
+                        with database:
+                            record_monthly_report_attempt(database, adapter.workspace_id, channel_id, last_month, now)
                         delivered = adapter.send_channel_leaderboard(channel_id, stats, is_monthly=True)
                         if delivered:
                             with database:
@@ -142,7 +160,7 @@ def main(argv: list[str] | None = None) -> None:
             bot_token=settings.slack_bot_token, app_token=settings.slack_app_token,
             process_event_fn=process, handle_action_fn=handle_action, enabled_channels=settings.enabled_channels,
             record_delivery_fn=acknowledge_delivery, record_reminder_fn=acknowledge_reminder, tick_fn=tick,
-            stats_fn=get_stats,
+            stats_fn=get_stats, claim_stats_fn=claim_stats, channel_language_fn=get_channel_language,
         )
 
 

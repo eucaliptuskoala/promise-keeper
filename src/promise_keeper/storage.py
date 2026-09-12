@@ -1,11 +1,11 @@
 """SQLite records, chronological history and recoverable outbound responses."""
 
 import json
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
-from promise_keeper.models import ActionResult, PipelineResult, PromiseRecord
+from promise_keeper.models import ActionResult, LeaderboardEntry, PipelineResult, PromiseRecord
 
 
 
@@ -59,6 +59,13 @@ def initialize_storage(path: str) -> sqlite3.Connection:
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS stats_commands (
+            workspace_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            claimed_at TEXT NOT NULL,
+            PRIMARY KEY(workspace_id, event_id)
         );
     """)
     return database
@@ -264,6 +271,17 @@ def pending_responses(database: sqlite3.Connection, workspace_id: str, now: date
     ).fetchall()
 
 
+def claim_stats_command(
+    database: sqlite3.Connection, workspace_id: str, event_id: str, channel_id: str, now: datetime,
+) -> bool:
+    """Claim a Slack stats event before posting, preventing duplicate replies on event replay."""
+    cursor = database.execute(
+        "INSERT OR IGNORE INTO stats_commands VALUES (?, ?, ?, ?)",
+        (workspace_id, event_id, channel_id, now.isoformat()),
+    )
+    return cursor.rowcount == 1
+
+
 def get_app_metadata(database: sqlite3.Connection, key: str) -> str | None:
     row = database.execute("SELECT value FROM app_metadata WHERE key = ?", (key,)).fetchone()
     return row["value"] if row else None
@@ -287,41 +305,107 @@ def record_monthly_report(
     set_app_metadata(database, f"monthly_report:{workspace_id}:{channel_id}", month_key, now)
 
 
-def get_unfulfilled_stats(
-    database: sqlite3.Connection, workspace_id: str, channel_id: str, now: datetime,
-) -> list[dict[str, Any]]:
-    """Aggregate unfulfilled commitments (confirmed/waiting with deadline_at < now) grouped by owner."""
-    now_utc = now.astimezone(timezone.utc)
-    if channel_id == "*":
-        rows = database.execute(
-            "SELECT record_json FROM promises WHERE workspace_id = ?",
-            (workspace_id,),
-        ).fetchall()
-    else:
-        rows = database.execute(
-            "SELECT record_json FROM promises WHERE workspace_id = ? AND channel_id = ?",
-            (workspace_id, channel_id),
-        ).fetchall()
-    promises = [PromiseRecord.model_validate_json(row["record_json"]) for row in rows]
+def get_monthly_report_attempts(
+    database: sqlite3.Connection, workspace_id: str, channel_id: str, month_key: str,
+) -> int:
+    value = get_app_metadata(database, f"monthly_report_attempts:{workspace_id}:{channel_id}:{month_key}")
+    return int(value) if value is not None else 0
+
+
+def record_monthly_report_attempt(
+    database: sqlite3.Connection, workspace_id: str, channel_id: str, month_key: str, now: datetime,
+) -> None:
+    attempts = get_monthly_report_attempts(database, workspace_id, channel_id, month_key) + 1
+    set_app_metadata(
+        database,
+        f"monthly_report_attempts:{workspace_id}:{channel_id}:{month_key}",
+        str(attempts),
+        now,
+    )
+
+
+def _month_bounds(month_key: str) -> tuple[datetime, datetime]:
+    year, month = (int(part) for part in month_key.split("-", maxsplit=1))
+    start = datetime(year, month, 1, tzinfo=timezone.utc)
+    end = datetime(year + 1, 1, 1, tzinfo=timezone.utc) if month == 12 else datetime(
+        year, month + 1, 1, tzinfo=timezone.utc,
+    )
+    return start, end
+
+
+def _aggregate_stats(promises: list[PromiseRecord], now: datetime) -> list[LeaderboardEntry]:
     overdue_by_owner: dict[str, list[PromiseRecord]] = {}
     for promise in promises:
-        if (
-            promise.status in ("confirmed", "waiting")
-            and promise.deadline_at is not None
-            and promise.deadline_at < now_utc
-        ):
-            overdue_by_owner.setdefault(promise.owner_id, []).append(promise)
-
+        overdue_by_owner.setdefault(promise.owner_id, []).append(promise)
     leaderboard = []
     for owner_id, items in overdue_by_owner.items():
-        sorted_items = sorted(items, key=lambda p: p.deadline_at or now_utc)
+        sorted_items = sorted(items, key=lambda promise: promise.deadline_at or now)
         leaderboard.append({
             "owner_id": owner_id,
             "overdue_count": len(items),
-            "sample_actions": [p.action for p in sorted_items[:3]],
+            "sample_actions": [promise.action for promise in sorted_items[:3]],
             "oldest_deadline_at": sorted_items[0].deadline_at,
         })
-
-    leaderboard.sort(key=lambda entry: (-entry["overdue_count"], entry["oldest_deadline_at"] or now_utc))
+    leaderboard.sort(key=lambda entry: (-entry["overdue_count"], entry["oldest_deadline_at"] or now))
     return leaderboard
+
+
+def _channel_promises(
+    database: sqlite3.Connection, workspace_id: str, channel_id: str,
+) -> list[PromiseRecord]:
+    rows = database.execute(
+        "SELECT record_json FROM promises WHERE workspace_id = ? AND channel_id = ?",
+        (workspace_id, channel_id),
+    ).fetchall()
+    return [PromiseRecord.model_validate_json(row["record_json"]) for row in rows]
+
+
+def get_unfulfilled_stats(
+    database: sqlite3.Connection, workspace_id: str, channel_id: str, now: datetime,
+) -> list[LeaderboardEntry]:
+    """Aggregate unfulfilled commitments (confirmed/waiting with deadline_at < now) grouped by owner."""
+    now_utc = now.astimezone(timezone.utc)
+    return _aggregate_stats(
+        [
+            promise for promise in _channel_promises(database, workspace_id, channel_id)
+            if promise.status in ("confirmed", "waiting")
+            and promise.deadline_at is not None
+            and promise.deadline_at < now_utc
+        ],
+        now_utc,
+    )
+
+
+def get_monthly_missed_deadline_stats(
+    database: sqlite3.Connection, workspace_id: str, channel_id: str, month_key: str,
+) -> list[LeaderboardEntry]:
+    """Aggregate commitments missed in one calendar month, including late completions."""
+    start, end = _month_bounds(month_key)
+    missed = []
+    for promise in _channel_promises(database, workspace_id, channel_id):
+        if promise.deadline_at is None:
+            continue
+        completed_late = (
+            promise.status == "completed"
+            and promise.deadline_at < promise.last_event_at
+            and start <= promise.last_event_at < end
+        )
+        still_overdue = (
+            promise.status in ("confirmed", "waiting")
+            and start <= promise.deadline_at < end
+        )
+        if completed_late or still_overdue:
+            missed.append(promise)
+    return _aggregate_stats(missed, end)
+
+
+def get_channel_dominant_language(
+    database: sqlite3.Connection, workspace_id: str, channel_id: str,
+) -> str:
+    """Return 'ru' if the majority of promises in the channel are in Russian, otherwise 'en'."""
+    promises = _channel_promises(database, workspace_id, channel_id)
+    if not promises:
+        return "en"
+    ru_count = sum(1 for promise in promises if re.search(r"[\u0400-\u04FF]", promise.action))
+    return "ru" if ru_count > len(promises) / 2 else "en"
 

@@ -2,9 +2,16 @@
 
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Literal
+from typing import Literal, TypedDict
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+
+
+class LeaderboardEntry(TypedDict):
+    owner_id: str
+    overdue_count: int
+    sample_actions: list[str]
+    oldest_deadline_at: datetime | None
 
 
 class ContextMessage(BaseModel):

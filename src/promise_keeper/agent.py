@@ -34,9 +34,9 @@ def _interpret_message(
         "Never return a naive datetime. "
         "If the commitment depends on another person or task being done first (e.g. 'after X', 'once Y is ready'), "
         "MUST set depends_on_promise_id to the candidate that must finish BEFORE the current commitment. "
-        "Dependency cues include 'after', 'once', 'after that', 'после', and 'как только'. "
-        "Resolve 'but first' and 'сначала' by which task must finish first. "
-        "'I will do X before Y' or 'сделаю X до Y' does not mean X depends on Y; never reverse this direction. "
+        "Dependency cues include 'after', 'once', and 'after that'. "
+        "Resolve 'but first' by which task must finish first. "
+        "'I will do X before Y' does not mean X depends on Y; never reverse this direction. "
         "Do not create an independent commitment when a prerequisite is clearly identified; "
         "if the candidate or direction is ambiguous, ask one concise clarification. "
         "If a relative timeframe is stated "
@@ -115,3 +115,4 @@ def run_agent(
         return _interpret_message(source, promises, client, model, timezone_name, thread_promises)
 
     return process_event(event, database, interpret)
+
