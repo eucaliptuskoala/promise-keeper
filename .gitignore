@@ -132,3 +132,4 @@ target/
 # Local configuration files
 .bpython_history
 .flake8
+/.air

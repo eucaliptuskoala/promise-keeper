@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "promise-keeper"
+version = "0.1.0"
+description = "Slack-native agent for tracking team commitments"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openai",
+    "pydantic",
+    "slack-bolt",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
