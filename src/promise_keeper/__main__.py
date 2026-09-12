@@ -10,10 +10,10 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import ValidationError
 
-from promise_keeper.agent import interpret_message
+from promise_keeper.agent import run_agent
 from promise_keeper.config import load_settings
-from promise_keeper.models import ActionResult, AgentDecision, NormalizedEvent, PipelineResult, PromiseRecord, UserAction
-from promise_keeper.pipeline import handle_user_action, process_event
+from promise_keeper.models import ActionResult, NormalizedEvent, PipelineResult, UserAction
+from promise_keeper.pipeline import handle_user_action
 from promise_keeper.reminders import check_reminders
 from promise_keeper.storage import bind_card, get_promise, initialize_storage, pending_responses, record_delivery
 
@@ -55,12 +55,9 @@ def main(argv: list[str] | None = None) -> None:
         timeout=settings.model_timeout_seconds,
         max_retries=0,
     ) as client:
-        def interpret(event: NormalizedEvent, promises: list[PromiseRecord]) -> AgentDecision:
-            return interpret_message(event, promises, client, settings.openai_model, settings.default_timezone)
-
         def process(event: NormalizedEvent) -> PipelineResult:
             with closing(initialize_storage(settings.database_path)) as database:
-                return process_event(event, database, interpret)
+                return run_agent(event, database, client, settings.openai_model, settings.default_timezone)
 
         def handle_action(action: UserAction) -> ActionResult:
             with closing(initialize_storage(settings.database_path)) as database:

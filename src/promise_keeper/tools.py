@@ -4,8 +4,56 @@ import sqlite3
 import uuid
 from datetime import timedelta, timezone
 
+from openai.types.chat import ChatCompletionFunctionToolParam
+
 from promise_keeper.models import ActionResult, AgentDecision, NormalizedEvent, PromiseRecord, UserAction
 from promise_keeper.storage import get_promise, is_delivered_card, record_history, save_promise
+
+
+MODEL_TOOL_DEFINITIONS = {
+    "create_promise": (
+        "create", "Create the author's firm commitment, pending owner confirmation.",
+        ("action", "evidence", "deadline_text", "deadline_at"),
+    ),
+    "complete_promise": (
+        "complete", "Complete one clearly matched confirmed promise owned by the author.",
+        ("promise_id", "evidence"),
+    ),
+    "reschedule_promise": (
+        "reschedule", "Change one confirmed promise's deadline using explicit source wording.",
+        ("promise_id", "evidence", "deadline_text", "deadline_at"),
+    ),
+    "ignore_message": ("ignore", "Ignore discussion or messages without an accepted commitment.", ()),
+    "ask_clarification": ("clarify", "Ask one concise question when the promise or update is ambiguous.", ("clarification",)),
+}
+
+
+def model_tools() -> list[ChatCompletionFunctionToolParam]:
+    """Expose only language arguments; trusted scope stays in the pipeline."""
+    properties = AgentDecision.model_json_schema()["properties"]
+    tools: list[ChatCompletionFunctionToolParam] = []
+    for name, (operation, description, fields) in MODEL_TOOL_DEFINITIONS.items():
+        arguments = {}
+        for field in fields:
+            if operation == "create" and field in ("deadline_text", "deadline_at"):
+                arguments[field] = {key: value for key, value in properties[field].items() if key != "default"}
+            else:
+                arguments[field] = next(schema for schema in properties[field]["anyOf"] if schema["type"] != "null")
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": arguments,
+                    "required": list(fields),
+                    "additionalProperties": False,
+                },
+            },
+        })
+    return tools
 
 
 def create_promise(database: sqlite3.Connection, event: NormalizedEvent, decision: AgentDecision) -> PromiseRecord:

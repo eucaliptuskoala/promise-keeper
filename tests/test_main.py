@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 from promise_keeper.__main__ import main
 from promise_keeper.config import Settings
 from promise_keeper.models import AgentDecision, NormalizedEvent, UserAction
+from promise_keeper.pipeline import process_event
 from promise_keeper.storage import get_promise, initialize_storage
 
 
@@ -19,7 +20,7 @@ def test_application_wires_retries_controls_and_reminders(tmp_path) -> None:
     decision = AgentDecision(operation="create", action="Send designs", evidence="I'll send designs",
                              deadline_text="by noon", deadline_at=now - timedelta(hours=1))
     with patch("promise_keeper.__main__.load_dotenv"), patch("promise_keeper.__main__.load_settings", return_value=settings), \
-         patch("promise_keeper.__main__.OpenAI"), patch("promise_keeper.__main__.interpret_message", return_value=decision), \
+         patch("promise_keeper.__main__.OpenAI"), patch("promise_keeper.__main__.run_agent", side_effect=lambda event, database, *_: process_event(event, database, lambda *_: decision)), \
          patch("promise_keeper.__main__.datetime") as clock, patch("promise_keeper.adapters.slack.SlackAdapter") as adapter_class:
         clock.now.return_value = now
         adapter = adapter_class.return_value
