@@ -206,6 +206,28 @@ def test_monthly_stats_include_late_completion_in_report_month(database) -> None
     assert stats[0]["overdue_count"] == 1
 
 
+def test_monthly_missed_deadline_stats_with_custom_timezone(database) -> None:
+    # Deadline on Sept 30 at 23:30 in New York (UTC-4 in Sep) -> Oct 1 03:30 UTC
+    ny_deadline = datetime(2026, 10, 1, 3, 30, tzinfo=timezone.utc)
+    promise = PromiseRecord(
+        promise_id="ny-promise", workspace_id="T1", channel_id="C1", thread_ts="100.1", owner_id="alice",
+        action="Finish report", deadline_text="End of September", deadline_at=ny_deadline, status="confirmed",
+        source_message_id="100.1", source_occurred_at=ny_deadline - timedelta(days=5),
+        created_at=ny_deadline - timedelta(days=5), updated_at=ny_deadline - timedelta(days=5),
+        last_event_at=ny_deadline - timedelta(days=5),
+    )
+    save_promise(database, promise)
+
+    # In UTC, Oct 1 03:30 is outside September (2026-09)
+    stats_utc = get_monthly_missed_deadline_stats(database, "T1", "C1", "2026-09", timezone_name="UTC")
+    assert len(stats_utc) == 0
+
+    # In America/New_York, it is Sept 30 23:30, so inside September (2026-09)
+    stats_ny = get_monthly_missed_deadline_stats(database, "T1", "C1", "2026-09", timezone_name="America/New_York")
+    assert len(stats_ny) == 1
+    assert stats_ny[0]["owner_id"] == "alice"
+
+
 def test_monthly_report_attempts_are_bounded_in_storage(database) -> None:
     now = datetime(2026, 9, 12, 12, tzinfo=timezone.utc)
 

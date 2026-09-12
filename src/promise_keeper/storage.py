@@ -4,6 +4,7 @@ import json
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from promise_keeper.models import ActionResult, LeaderboardEntry, PipelineResult, PromiseRecord
 
@@ -324,12 +325,13 @@ def record_monthly_report_attempt(
     )
 
 
-def _month_bounds(month_key: str) -> tuple[datetime, datetime]:
+def _month_bounds(month_key: str, timezone_name: str = "UTC") -> tuple[datetime, datetime]:
+    tz = timezone.utc if timezone_name == "UTC" else ZoneInfo(timezone_name)
     year, month = (int(part) for part in month_key.split("-", maxsplit=1))
-    start = datetime(year, month, 1, tzinfo=timezone.utc)
-    end = datetime(year + 1, 1, 1, tzinfo=timezone.utc) if month == 12 else datetime(
-        year, month + 1, 1, tzinfo=timezone.utc,
-    )
+    start = datetime(year, month, 1, tzinfo=tz).astimezone(timezone.utc)
+    end = (
+        datetime(year + 1, 1, 1, tzinfo=tz) if month == 12 else datetime(year, month + 1, 1, tzinfo=tz)
+    ).astimezone(timezone.utc)
     return start, end
 
 
@@ -378,9 +380,10 @@ def get_unfulfilled_stats(
 
 def get_monthly_missed_deadline_stats(
     database: sqlite3.Connection, workspace_id: str, channel_id: str, month_key: str,
+    timezone_name: str = "UTC",
 ) -> list[LeaderboardEntry]:
     """Aggregate commitments missed in one calendar month, including late completions."""
-    start, end = _month_bounds(month_key)
+    start, end = _month_bounds(month_key, timezone_name)
     missed = []
     for promise in _channel_promises(database, workspace_id, channel_id):
         if promise.deadline_at is None:

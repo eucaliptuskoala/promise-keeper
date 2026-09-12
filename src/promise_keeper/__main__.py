@@ -5,6 +5,7 @@ import logging
 import signal
 from contextlib import closing
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from openai import OpenAI
@@ -114,7 +115,8 @@ def main(argv: list[str] | None = None) -> None:
 
         def tick() -> None:
             now = datetime.now(timezone.utc)
-            current_month_key = now.strftime("%Y-%m")
+            tz = timezone.utc if settings.default_timezone == "UTC" else ZoneInfo(settings.default_timezone)
+            current_month_key = now.astimezone(tz).strftime("%Y-%m")
             with closing(initialize_storage(settings.database_path)) as database:
                 for row in pending_responses(database, adapter.workspace_id, now):
                     if row["kind"] in ("message", "owner_card"):
@@ -147,7 +149,7 @@ def main(argv: list[str] | None = None) -> None:
                         database, adapter.workspace_id, channel_id, last_month,
                     ) < 3:
                         stats = get_monthly_missed_deadline_stats(
-                            database, adapter.workspace_id, channel_id, last_month,
+                            database, adapter.workspace_id, channel_id, last_month, settings.default_timezone,
                         )
                         with database:
                             record_monthly_report_attempt(database, adapter.workspace_id, channel_id, last_month, now)
